@@ -33,6 +33,7 @@ __revision__ = '$Format:%H$'
 from qgis.core import QgsProcessingProvider
 from .ajout_trafic import AjoutTrafic
 from .calcul_final import AMC
+from .trip_generation import TripGeneration
 
 
 class CyclingFacilitiesProvider(QgsProcessingProvider):
@@ -56,8 +57,7 @@ class CyclingFacilitiesProvider(QgsProcessingProvider):
         """
         self.addAlgorithm(AjoutTrafic())
         self.addAlgorithm(AMC())
-        # add additional algorithms here
-        # self.addAlgorithm(MyOtherAlgorithm())
+        self.addAlgorithm(TripGeneration())
 
     def id(self):
         """

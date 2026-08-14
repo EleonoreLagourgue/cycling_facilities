@@ -37,7 +37,13 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingParameterField,
                        QgsProcessingParameterString,
                        QgsProcessingParameterEnum, 
-                       QgsProcessingParameterNumber)
+                       QgsProcessingParameterNumber,
+                       QgsProcessingParameterFile,
+                       QgsFeature,
+                       QgsWkbTypes,
+                       QgsGeometry,
+                       QgsFields,
+                       QgsField)
 
 from qgis.analysis import (
     QgsVectorLayerDirector,
@@ -46,9 +52,11 @@ from qgis.analysis import (
     QgsGraphBuilder,
     QgsGraphAnalyzer
 )
+from qgis import processing
 
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from scipy.spatial import cKDTree
+import pandas as pd
 
 
 
@@ -70,9 +78,10 @@ class TripGeneration(QgsProcessingAlgorithm):
     RESEAU = 'RESEAU'
     ACCIDENTS = "ACCIDENTS"
     VITESSE = 'VITESSE'
-    OD = 'OD'
+    OD_MATRIX = 'OD_MATRIX'
     ORIGINE = "ORIGINE"
     DESTINATION = "DESTINATION"
+    COMPTEUR = 'COMPTEUR'
     
     SERVICES = 'SERVICES'
     IDSERV = 'IDSERV'
@@ -191,12 +200,12 @@ class TripGeneration(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFile(self.OD_MATRIX, "Matrice OD"))
 
         self.addParameter(QgsProcessingParameterString(self.ORIGINE, 
-                                                       "Colonne origine"))
+                                                       "Colonne origine (obligatoire si matrice OD)"))
         self.addParameter(QgsProcessingParameterString(self.DESTINATION, 
-                                                      "Colonne destination",
+                                                      "Colonne destination(obligatoire si matrice OD)",
                                                       ))
         self.addParameter(QgsProcessingParameterString(self.COMPTEUR, 
-                                                      "Colonne renseignant le volume de flux entre origine et destination",
+                                                      "Colonne renseignant le volume de flux entre origine et destination (obligatoire si matrice OD)",
                                                       ))
         self.addParameter(
             QgsProcessingParameterFeatureSource(
@@ -212,7 +221,13 @@ class TripGeneration(QgsProcessingAlgorithm):
                                                parentLayerParameterName=self.SERVICES,
                                                optional = True))                          
         self.addParameter(QgsProcessingParameterNumber(self.TOLERANCE, self.tr("Tolérance topologique (en mètres)"), defaultValue=0.0))
-
+        
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT,
+                self.tr('Output layer')
+            )
+        )
     
     def processAlgorithm(self, parameters, context, feedback):
         """
@@ -232,20 +247,31 @@ class TripGeneration(QgsProcessingAlgorithm):
         value_backward = self.parameterAsString(parameters, self.VALUE_BACKWARD, context)
         value_both = self.parameterAsString(parameters, self.VALUE_BOTH, context)
         default_direction = self.parameterAsString(parameters, self.DEFAULT_DIRECTION, context)
-
+        
+        od_matrix = self.parameterAsFile(parameters, self.OD_MATRIX, context)
+        origine = self.parameterAsString(parameters, self.ORIGINE, context)
+        dest = self.parameterAsString(parameters, self.DESTINATION, context)
+        cpt = self.parameterAsString(parameters, self.COMPTEUR, context)
 
         services = self.parameterAsSource(parameters, self.SERVICES, context)#QgsProcessingFeatureSource
         pop_column = self.parameterAsString(parameters, self.COLPOP,context)
         id_service = self.parameterAsString(parameters, self.IDSERV,context)
 
-        if (services is None and pop_column is not None) or (services is not None and pop_column is None):
+        if (services is None and pop_column ) or (services is not None and not pop_column ):
             feedback.pushWarning(" Erreur : il manque une des deux informations \n Colonne population ou couche de services")
-            break
+            exit()
         
+        test_liste = [od_matrix, origine, dest, cpt]
+        res = [i for i in range(len(test_liste)) if test_liste[i] == None or not test_liste[i]]
+
+        if 0<len(res)<4:
+            feedback.pushWarning(" Erreur : il manque une des quatre informations \n Matrice OD, Colonne deestination/origine/compteur")
+            exit()
         
+        idx_key = reseau.fields().indexOf(colonne_direction)
         director = QgsVectorLayerDirector(
             reseau,
-            -1,        # index du champ de direction (-1 si pas de sens unique)
+            idx_key,        # index du champ de direction (-1 si pas de sens unique)
             value_forward,        # valeur "sens direct"
             value_backward,        # valeur "sens inverse"
             value_both,        # valeur "double sens"
@@ -260,121 +286,132 @@ class TripGeneration(QgsProcessingAlgorithm):
         #my_lyr = QgsVectorLayer('Linestring?crs=epsg:2154', 'network result', 'memory')
         Points_dep = []
         NbPop =[]
+        IdPop = []
         for feat in pop.getFeatures():
             geom = feat.geometry().asPoint()
-            if pop_column is not None:
+            IdPop.append(feat[id_pop])
+            if pop_column:
                 nb_pop = feat[pop_column]
-                NbPop.add(nb_pop)
-            Points_dep.add(geom)
+                NbPop.append(nb_pop)
+            Points_dep.append(geom)
+        
+        edge_traffic = defaultdict(lambda: {'poids': 0.0, 'p1': None, 'p2': None})
+        n_orig = len(pop.getFeatures())
+
         if services is not None:
             Points_arr =[]
             for feat in services.getFeatures():
                 geom = feat.geometry().asPoint()
-                Points_arr.add(geom)
+                Points_arr.append(geom)
             
             Points = Points_dep +Points_arr
             tiedPoints = director.makeGraph(builder, [Points]) 
             graph = builder.graph()
             
-            result = processing.run("qgis:distancematrix", {
-                'INPUT': pop,'INPUT_FIELD':'AXE',
-                'TARGET':services,'TARGET_FIELD':'id',
-                'MATRIX_TYPE':0,'NEAREST_POINTS':1,
-                'OUTPUT':'TEMPORARY_OUTPUT'})['OUTPUT']
+            # result = processing.run("qgis:distancematrix", {
+            #     'INPUT': pop,'INPUT_FIELD':'AXE',
+            #     'TARGET':services,'TARGET_FIELD':'id',
+            #     'MATRIX_TYPE':0,'NEAREST_POINTS':1,
+            #     'OUTPUT':'TEMPORARY_OUTPUT'})['OUTPUT']
             
-            n_orig = len(pop.getFeatures())
-            vertex_origines = [graph.findVertex(tied_points[i]) for i in range(n_orig)]
-            vertex_destinations = [graph.findVertex(tied_points[n_orig + j]) for j in range(len(services.getFeatures()))]
-            results = []
+            vertex_origines = [graph.findVertex(tiedPoints[i]) for i in range(n_orig)]
+            vertex_destinations = [graph.findVertex(tiedPoints[n_orig + j]) for j in range(len(services.getFeatures()))]
+            assignations = []
             
             for i, v_orig in enumerate(vertex_origines):
                 if feedback.isCanceled():
                             break
-                (tree, cost) = QgsGraphAnalyzer.dijkstra(graph, startId, 0)
+                (tree, cost) = QgsGraphAnalyzer.dijkstra(graph, v_orig, 0)
+                best_j, best_v, best_cost = None, None, None
                 for j, v_dest in enumerate(vertex_destinations):
-                    if tree[v_dest] == -1 and v_dest != v_orig:
+                    if v_dest == v_orig:
+                        c = 0.0
+                    elif tree[v_dest] == -1 and v_dest != v_orig:
                         feedback.pushWarning(f"Pas de chemin entre origine {i} et destination {j}")
                         continue
-        
+                    else:
+                        c = cost[v_dest]
+                    
+                    # On compare avec les résultats trouvés avant
+                    if best_cost is None or c < best_cost:
+                        best_cost, best_j, best_v = c, j, v_dest
+                    if best_j is None:
+                        feedback.pushWarning(f"Commune {i} : aucun service atteignable")
+                        continue
+                    assignations.append({
+                        'commune_idx': i,
+                        'service_idx': best_j,
+                        'distance': best_cost
+                    })
                     # Reconstruction du chemin en remontant les arêtes depuis la destination
-                    path_vertices = []
-                    current = v_dest
+                    current = best_v
                     while current != v_orig:
-                        path_vertices.append(current)
                         edge_id = tree[current]
                         if edge_id == -1:
                             break
-                        edge = graph.edge(edge_id)
-                        current = edge.fromVertex()
-                    path_vertices.append(v_orig)
-                    path_vertices.reverse()
+                        key, p1, p2 = self.edge_key(graph, edge_id)
+                        edge_traffic[key]['poids'] += NbPop[i]
+                        edge_traffic[key]['p1'] = p1
+                        edge_traffic[key]['p2'] = p2
+                        current = graph.edge(edge_id).fromVertex()
+                        
         
-                    # Construction de la géométrie ligne à partir des sommets
-                    points = [graph.vertex(v).point() for v in path_vertices]
-                    geom = QgsGeometry.fromPolylineXY(points)
+                    
         
-                    results.append({
-                        'origine_idx': i,
-                        'destination_idx': j,
-                        'distance': cost[v_dest],
-                        'geometry': geom
-                    })
-        else:
-            vertex_origines = [graph.findVertex(tied_points[i]) for i in range(n_orig)]
-            results = []
+                    
+        elif od_matrix is not None:
+            df_matrix = pd.read_csv(od_matrix)
+            vertex_origines = [graph.findVertex(tiedPoints[i]) for i in range(n_orig)]
             for i, v_orig in enumerate(vertex_origines):
                 if feedback.isCanceled():
                             break
-                (tree, cost) = QgsGraphAnalyzer.dijkstra(graph, startId, 0)
-    
+                (tree, cost) = QgsGraphAnalyzer.dijkstra(graph, v_orig, 0)
+                id_ori = IdPop[i]
+                od = df_matrix[df_matrix[origine] == id_ori]
                 for j , v_dest in enumerate(vertex_origines):
-                    if i =! j:
+                    if i != j:
                         if tree[v_dest] == -1 and v_dest != v_orig:
                             feedback.pushWarning(f"Pas de chemin entre origine {i} et destination {j}")
                             continue
-                        path_vertices = []
+                        if od[dest] == j:
+                            pop = od[cpt][od[dest] == j]
+                            od_velo = pop * 3/100 # Part du vélo à environ 3% dans les trajets domicile-travail
                         current = v_dest
                         while current != v_orig:
-                            path_vertices.append(current)
                             edge_id = tree[current]
                             if edge_id == -1:
                                 break
-                            edge = graph.edge(edge_id)
-                            current = edge.fromVertex()
-                        path_vertices.append(v_orig)
-                        path_vertices.reverse()
+                            key, p1, p2 = self.edge_key(graph, edge_id)
+                            edge_traffic[key]['poids'] += od_velo
+                            edge_traffic[key]['p1'] = p1
+                            edge_traffic[key]['p2'] = p2
+                            current = graph.edge(edge_id).fromVertex()
+
+                            
             
-                        # Construction de la géométrie ligne à partir des sommets
-                        points = [graph.vertex(v).point() for v in path_vertices]
-                        geom = QgsGeometry.fromPolylineXY(points)
-            
-                        results.append({
-                            'origine_idx': i,
-                            'destination_idx': j,
-                            'distance': cost[v_dest],
-                            'geometry': geom
-                        })
                         
                         
-        for r in results:
-        feat = QgsFeature(fields)
-        feat.setGeometry(r['geometry'])
-        feat.setAttributes([r['origine_idx'], r['destination_idx'], r['distance']])
-        sink.addFeature(feat, QgsFeatureSink.FastInsert)
-        
+        fields_traffic = QgsFields()
+        fields_traffic.append(QgsField('trafic', QVariant.Double))
+        (sink_traffic, dest_id) = self.parameterAsSink(
+        parameters, self.OUTPUT_TRAFIC, context,
+        fields_traffic, QgsWkbTypes.LineString, reseau.crs()
+        )
+        for key, data in edge_traffic.items():
+            geom = QgsGeometry.fromPolylineXY([data['p1'], data['p2']])
+            feat = QgsFeature(fields_traffic)
+            feat.setGeometry(geom)
+            feat.setAttributes([data['poids']])
+            sink_traffic.addFeature(feat, QgsFeatureSink.FastInsert)
         return {self.OUTPUT: dest_id}
     
-    def find_nearest_service(self, pop, services, geom_pop, geom_services):
-        
-        result = processing.run("qgis:distancematrix", {
-            'INPUT': pop,'INPUT_FIELD':'AXE',
-            'TARGET':services,'TARGET_FIELD':'id',
-            'MATRIX_TYPE':0,'NEAREST_POINTS':1,
-            'OUTPUT':'TEMPORARY_OUTPUT'})['OUTPUT']
-        coords = np.array(list(zip(geom_pop.geometry.x(), geom_pop.geometry.y())))
-        coords_recherche = np.array(list(zip(geom_services.geometry.x(), geom_services.geometry.y())))
-        tree = cKDTree(coords_recherche)
-        distances, indices = tree.query(coords)
-        nearest_services = service.loc[indices]
-        print(nearest_services)
-        return indices
+    
+    def edge_key(self, graph, edge_id, precision=6):
+        """Clé indépendante du sens de parcours, pour fusionner aller/retour."""
+        edge = graph.edge(edge_id)
+        p1 = graph.vertex(edge.fromVertex()).point()
+        p2 = graph.vertex(edge.toVertex()).point()
+        k1 = (round(p1.x(), precision), round(p1.y(), precision))
+        k2 = (round(p2.x(), precision), round(p2.y(), precision))
+        return tuple(sorted([k1, k2])), p1, p2
+    
