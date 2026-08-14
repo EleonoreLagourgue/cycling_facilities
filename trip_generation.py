@@ -197,16 +197,18 @@ class TripGeneration(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterString(self.DEFAULT_SPEED, self.tr("Vitesse par défaut"), defaultValue=50))
         
         #Destinations
-        self.addParameter(QgsProcessingParameterFile(self.OD_MATRIX, "Matrice OD"))
+        self.addParameter(QgsProcessingParameterFile(self.OD_MATRIX, "Matrice OD",
+                                                     optional = True))
 
         self.addParameter(QgsProcessingParameterString(self.ORIGINE, 
-                                                       "Colonne origine (obligatoire si matrice OD)"))
+                                                       "Colonne origine (obligatoire si matrice OD)",
+                                                       optional = True))
         self.addParameter(QgsProcessingParameterString(self.DESTINATION, 
                                                       "Colonne destination(obligatoire si matrice OD)",
-                                                      ))
+                                                      optional = True))
         self.addParameter(QgsProcessingParameterString(self.COMPTEUR, 
                                                       "Colonne renseignant le volume de flux entre origine et destination (obligatoire si matrice OD)",
-                                                      ))
+                                                      optional = True))
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.SERVICES,
@@ -296,16 +298,18 @@ class TripGeneration(QgsProcessingAlgorithm):
             Points_dep.append(geom)
         
         edge_traffic = defaultdict(lambda: {'poids': 0.0, 'p1': None, 'p2': None})
-        n_orig = len(pop.getFeatures())
+        n_orig = pop.featureCount()
 
         if services is not None:
+            feedback.pushInfo("Méthode déplacements vers services")
+
             Points_arr =[]
             for feat in services.getFeatures():
                 geom = feat.geometry().asPoint()
                 Points_arr.append(geom)
             
             Points = Points_dep +Points_arr
-            tiedPoints = director.makeGraph(builder, [Points]) 
+            tiedPoints = director.makeGraph(builder, Points) 
             graph = builder.graph()
             
             # result = processing.run("qgis:distancematrix", {
@@ -315,7 +319,7 @@ class TripGeneration(QgsProcessingAlgorithm):
             #     'OUTPUT':'TEMPORARY_OUTPUT'})['OUTPUT']
             
             vertex_origines = [graph.findVertex(tiedPoints[i]) for i in range(n_orig)]
-            vertex_destinations = [graph.findVertex(tiedPoints[n_orig + j]) for j in range(len(services.getFeatures()))]
+            vertex_destinations = [graph.findVertex(tiedPoints[n_orig + j]) for j in range((services.featureCount()))]
             assignations = []
             
             for i, v_orig in enumerate(vertex_origines):
@@ -360,7 +364,13 @@ class TripGeneration(QgsProcessingAlgorithm):
         
                     
         elif od_matrix is not None:
-            df_matrix = pd.read_csv(od_matrix)
+            feedback.pushInfo("Méthode déplacements vers travail")
+
+            tiedPoints = director.makeGraph(builder, Points_dep) 
+            graph = builder.graph()
+            
+            
+            df_matrix = pd.read_csv(od_matrix, sep = None, engine = 'python')
             vertex_origines = [graph.findVertex(tiedPoints[i]) for i in range(n_orig)]
             for i, v_orig in enumerate(vertex_origines):
                 if feedback.isCanceled():
@@ -373,28 +383,32 @@ class TripGeneration(QgsProcessingAlgorithm):
                         if tree[v_dest] == -1 and v_dest != v_orig:
                             feedback.pushWarning(f"Pas de chemin entre origine {i} et destination {j}")
                             continue
-                        if od[dest] == j:
+                        if j in od[dest].values:
                             pop = od[cpt][od[dest] == j]
+                            
                             od_velo = pop * 3/100 # Part du vélo à environ 3% dans les trajets domicile-travail
-                        current = v_dest
-                        while current != v_orig:
-                            edge_id = tree[current]
-                            if edge_id == -1:
-                                break
-                            key, p1, p2 = self.edge_key(graph, edge_id)
-                            edge_traffic[key]['poids'] += od_velo
-                            edge_traffic[key]['p1'] = p1
-                            edge_traffic[key]['p2'] = p2
-                            current = graph.edge(edge_id).fromVertex()
+                            current = v_dest
+                            while current != v_orig:
+                                edge_id = tree[current]
+                                if edge_id == -1:
+                                    break
+                                key, p1, p2 = self.edge_key(graph, edge_id)
+                                edge_traffic[key]['poids'] += od_velo
+                                edge_traffic[key]['p1'] = p1
+                                edge_traffic[key]['p2'] = p2
+                                current = graph.edge(edge_id).fromVertex()
+                        else:
+                            feedback.pushInfo("Pas de trajet déclaré")
+                            continue
 
                             
             
                         
-                        
+        feedback.pushInfo("Ecriture dans le sink")
         fields_traffic = QgsFields()
         fields_traffic.append(QgsField('trafic', QVariant.Double))
         (sink_traffic, dest_id) = self.parameterAsSink(
-        parameters, self.OUTPUT_TRAFIC, context,
+        parameters, self.OUTPUT, context,
         fields_traffic, QgsWkbTypes.LineString, reseau.crs()
         )
         for key, data in edge_traffic.items():
