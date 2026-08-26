@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """
 /***************************************************************************
  CyclingFacilities
@@ -32,49 +30,48 @@ __revision__ = '$Format:%H$'
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (QgsProcessing,
+                       QgsFeatureRequest,
                        QgsFeatureSink,
                        QgsProcessingAlgorithm,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
+                       QgsProcessingParameterRasterDestination,
                        QgsProcessingParameterField,
                        QgsProcessingParameterString,
                        QgsProcessingParameterEnum, 
-                       QgsProcessingParameterNumber)
+                       QgsProcessingParameterNumber,
+                       QgsProcessingParameterFile,
+                       QgsFeature,
+                       QgsWkbTypes,
+                       QgsGeometry,
+                       QgsFields,
+                       QgsField)
 
 from qgis.analysis import (
     QgsVectorLayerDirector,
     QgsNetworkDistanceStrategy,
     QgsNetworkSpeedStrategy,
     QgsGraphBuilder,
-    QgsGraphAnalyzer
+    QgsGraphAnalyzer,
+    QgsInterpolator, QgsTinInterpolator
 )
+
 from qgis import processing
 
+from collections import OrderedDict, defaultdict
+from scipy.spatial import cKDTree
+import pandas as pd
 
-
-class AMC(QgsProcessingAlgorithm):
+class Rasterisation(QgsProcessingAlgorithm):
     """
-    Algorithme pour calculer le résultat final.
-    Retourne un raster
+    Algorithme pour trouver où sont les aménagements cyclables déjà en place
+    et où il y a discontinuité
     """
-
-    # Constants used to refer to parameters and outputs. They will be
-    # used when calling the algorithm from another algorithm, or when
-    # calling from the QGIS console.
-
-    OUTPUT = 'OUTPUT'
     INPUT = 'INPUT'
-    POIDS_TRA = 'POIDS_TRA'
-    RESEAU = 'RESEAU'
-    POIDS_RES = 'POIDS_RES'
-    ACCIDENTS = "ACCIDENTS"
-    POIDS_ACC ="POIDS_ACC"
-    VITESSE = 'VITESSE'
-    POIDS_VIT = 'POIDS_VIT'
-    PENTE = 'PENTE'
-    POIDS_PEN = 'POIDS_PEN'
+    COLAME = 'COLAME'
 
-
+    
+    OUTPUT = 'OUTPUT'
     
     def name(self):
         """
@@ -84,8 +81,8 @@ class AMC(QgsProcessingAlgorithm):
         lowercase alphanumeric characters only and no spaces or other
         formatting characters.
         """
-        return 'Calcul final'
-
+        return 'Rasteriser le critère'
+    
     def displayName(self):
         """
         Returns the translated algorithm name, which should be used for any
@@ -108,92 +105,87 @@ class AMC(QgsProcessingAlgorithm):
         contain lowercase alphanumeric characters only and no spaces or other
         formatting characters.
         """
-        return 'Résultat'
+        return 'Traitements'
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)
 
     def createInstance(self):
-        return AMC()
-    
-    
+        return Rasterisation()
     def initAlgorithm(self, config):
         
-
-        # We add the input vector features source. It can have any kind of
-        # geometry.
-        self.addParameter(
-            QgsProcessingParameterFeatureSource(
-                self.ACCIDENTS,
-                self.tr('Raster d"accidents'),
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.POIDS_ACC,
-                self.tr('Poids des accidents'),
-            )
-        )
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT,
-                self.tr('Raster de trafic'),
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.POIDS_TRA,
-                self.tr('Poids du trafic'),
+                self.tr('Critère à rasteriser'),
+                
             )
         )
         
+        self.addParameter(QgsProcessingParameterField(self.COLAME, 
+                                                      self.tr("Colonne à rasteriser (optionnel)"),
+                                                      parentLayerParameterName=self.INPUT,
+                                                      optional= True,
+                                                      ))
         self.addParameter(
-            QgsProcessingParameterFeatureSource(
-                self.RESEAU,
-                self.tr('Raster de connectivité réseau'),
+            QgsProcessingParameterRasterDestination(
+                self.OUTPUT,
+                self.tr('Raster de sortie')
             )
         )
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.POIDS_RES,
-                self.tr('Poids de connectivité réseau'),
-            )
-        )
-        
-        self.addParameter(
-            QgsProcessingParameterFeatureSource(
-                self.VITESE,
-                self.tr('Raster de vitesse'),
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.POIDS_VIT,
-                self.tr('Poids de la vitesse'),
-            )
-        )
-    
     
     def processAlgorithm(self, parameters, context, feedback):
         """
         Here is where the processing itself takes place.
         """
+        inp = self.parameterAsSource(parameters, self.INPUT, context)
+        col = self.parameterAsString(parameters, self.COLAME, context)
+        output_path = self.parameterAsOutputLayer(parameters, self.OUTPUT, context) #string
 
-        # Retrieve the feature source and sink. The 'dest_id' variable is used
-        # to uniquely identify the feature sink, and must be included in the
-        # dictionary returned by the processAlgorithm function.
-        trafic = self.parameterAsSource(parameters, self.INPUT, context)
-        poids_trafic = self.parameterAsDouble(parameters, self.POIDS_TRA, context)
-        
-        
-        
-        
-        processing.run("native:rastercalc", 
-                       {'LAYERS':
-                        [trafic,''],
-                        'EXPRESSION':f'{trafic} * {poids_trafic}',
-                        'EXTENT':None,
-                        'CELL_SIZE':None,
-                        'CRS':None,
+        if col:
+            raster = processing.run("gdal:rasterize", 
+                       {'INPUT': inp,
+                        'FIELD':col,
+                        'BURN':0,
+                        'USE_Z':False,
+                        'UNITS':1,
+                        'WIDTH':10,'HEIGHT':10,
+                        'EXTENT':None,'NODATA':0,
                         'CREATION_OPTIONS':None,
+                        'DATA_TYPE':5,'INIT':None,
+                        'INVERT':False,'EXTRA':'',
+                        'OUTPUT':'memory:'})['OUTPUT']
+        else:
+            raster = processing.run("gdal:rasterize", 
+                       {'INPUT': inp,
+                        'FIELD':'',
+                        'BURN':0,
+                        'USE_Z':False,
+                        'UNITS':1,
+                        'WIDTH':10,'HEIGHT':10,
+                        'EXTENT':None,'NODATA':0,
+                        'CREATION_OPTIONS':None,
+                        'DATA_TYPE':5,'INIT':None,
+                        'INVERT':False,'EXTRA':'',
+                        'OUTPUT':'memory:'})['OUTPUT']
+        
+        result = processing.run("gdal:rastercalculator", 
+                       {'INPUT_A':raster,
+                        'BAND_A':1,
+                        'INPUT_B':None,'BAND_B':None,
+                        'INPUT_C':None,'BAND_C':None,
+                        'INPUT_D':None,'BAND_D':None,
+                        'INPUT_E':None,'BAND_E':None,
+                        'INPUT_F':None,'BAND_F':None,
+                        'FORMULA':'(A - A.min()) / (A.max() - A.min())',
+                        'NO_DATA':None,
+                        'EXTENT_OPT':0,'PROJWIN':None,
+                        'RTYPE':5,'CREATION_OPTIONS':None,
+                        'EXTRA':'',
                         'OUTPUT':'memory:'})
+        
+        
+        
+        return {self.OUTPUT: result['OUTPUT']}
+        
+        

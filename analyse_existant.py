@@ -195,20 +195,21 @@ class AnalyseExistant(QgsProcessingAlgorithm):
         join = processing.run(
         "native:joinbynearest",
         {'INPUT': extremites,
-         'INPUT_2': velo_nodes,
-         'FIELDS_TO_COPY': ['cluster'],
+         'INPUT_2': velo_lines,
+         'FIELDS_TO_COPY': ['comp'],
          'DISCARD_NONMATCHING': False,
          'PREFIX': 'velo_',
          'NEIGHBORS': 1,
          'MAX_DISTANCE': 50,
          'OUTPUT': 'memory:'})['OUTPUT']
+        #Plutôt qu'une jointure peut être trouver là où touche les bouts
         
         clusters_par_segment = defaultdict(dict)  # {feature_id: {vertex_index: cluster}}
         
         for f in join.getFeatures():
             fid_origine = f['seg_id']   
             vidx = f['vertex_index']
-            cluster = f['velo_compo']
+            cluster = f['velo_comp']
             clusters_par_segment[fid_origine][vidx] = cluster
 
         candidats_ids = []
