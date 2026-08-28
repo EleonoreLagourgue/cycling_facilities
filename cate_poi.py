@@ -31,13 +31,15 @@ __copyright__ = '(C) 2026 by Eleonore Lagourgue'
 
 __revision__ = '$Format:%H$'
 
-from qgis.PyQt.QtCore import QCoreApplication
+from qgis.PyQt.QtCore import QCoreApplication, QVariant
+
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
                        QgsProcessingAlgorithm,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink)
 from qgis.core import *
+import fnmatch
 
 
 
@@ -48,18 +50,23 @@ class CateServices(QgsProcessingAlgorithm):
     OUTPUT = 'OUTPUT'
 
 
-    def tr(self, string):
-        return QCoreApplication.translate("AddGradeAlgorithm", string)
- 
-    def createInstance(self):
-        return AddGradeAlgorithm()
- 
     def name(self):
-        return "road_network_grades"
- 
+        """
+        Returns the algorithm name, used for identifying the algorithm. This
+        string should be fixed for the algorithm, and must not be localised.
+        The name should be unique within each provider. Names should contain
+        lowercase alphanumeric characters only and no spaces or other
+        formatting characters.
+        """
+        return "Catégoriser les points d'intérêt"
+    
     def displayName(self):
-        return self.tr("Ajouter la pente aux lignes d'un réseau")
- 
+        """
+        Returns the translated algorithm name, which should be used for any
+        user-visible display of the algorithm name.
+        """
+        return self.tr(self.name())
+
     def group(self):
         """
         Returns the name of the group this algorithm belongs to. This string
@@ -75,8 +82,9 @@ class CateServices(QgsProcessingAlgorithm):
         contain lowercase alphanumeric characters only and no spaces or other
         formatting characters.
         """
-        return 'Traitements'
-    
+        return 'Formatage'
+    def tr(self, string):
+        return QCoreApplication.translate('Processing', string)
 
 
     def createInstance(self):
@@ -84,7 +92,6 @@ class CateServices(QgsProcessingAlgorithm):
     
     def initAlgorithm(self, config=None):
 
-        # 1. Couche source (ex : bpe47)
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT,
@@ -93,7 +100,6 @@ class CateServices(QgsProcessingAlgorithm):
             )
         )
 
-        # 2. Colonne à classer (ex : sdom)
         self.addParameter(
             QgsProcessingParameterField(
                 self.FIELD,
@@ -103,7 +109,6 @@ class CateServices(QgsProcessingAlgorithm):
             )
         )
 
-        # 3. Table de correspondance éditable (remplace les CASE WHEN)
         matrix_param = QgsProcessingParameterMatrix(
             self.CATEGORIES,
             "Table de correspondance des catégories",
@@ -129,7 +134,6 @@ class CateServices(QgsProcessingAlgorithm):
         ])
         self.addParameter(matrix_param,)
 
-        # 4. Couche de sortie
         self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT,
@@ -180,7 +184,7 @@ class CateServices(QgsProcessingAlgorithm):
             })
 
         # Champs de sortie = champs d'origine + champs de classification
-        out_fields = QgsFields(source.fields())
+        out_fields = QgsFields()
         out_fields.append(QgsField('category_id', QVariant.Int))
         out_fields.append(QgsField('category_name', QVariant.String))
         out_fields.append(QgsField('poids', QVariant.Int))
@@ -210,7 +214,7 @@ class CateServices(QgsProcessingAlgorithm):
                 for cat in categories:
                     # 1ère catégorie du tableau qui matche = priorité à l'ordre
                     # (équivalent à l'ordre des WHEN dans le CASE SQL)
-                    if any(fnmatch.fnmatchcase(value_str, p) for p in cat['patterns']):
+                    if any(fnmatch.fnmatchcase(value_str, p) for p in cat['valeurs']):
                         matched = cat
                         break
 
@@ -218,9 +222,10 @@ class CateServices(QgsProcessingAlgorithm):
             new_feat.setGeometry(feat.geometry())
             attrs = feat.attributes()
             if matched:
-                attrs += [matched['id'], matched['name'], matched['threshold'], matched['speed']]
+                attrs += [matched['id'], matched['nom'], matched['poids'], matched['vitesse']]
             else:
-                attrs += [None, None, None, None]
+                #attrs += [None, None, None, None]
+                continue
             new_feat.setAttributes(attrs)
 
             sink.addFeature(new_feat, QgsFeatureSink.FastInsert)

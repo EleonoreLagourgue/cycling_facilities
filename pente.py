@@ -214,6 +214,9 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
             feedback.setProgress(30 + int(30 * j / n_nodes))
  
         # ---- Préparation des champs de sortie ----
+        pr = source.dataProvider()
+        source.startEditing()
+        
         out_fields = QgsFields(source.fields())
         for fname, ftype in (
             ("elev_start", QVariant.Double),
@@ -222,16 +225,14 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
             ("grade", QVariant.Double),
             ("grade_abs", QVariant.Double),
         ):
-            out_fields.append(QgsField(fname, ftype))
- 
-        (sink, dest_id) = self.parameterAsSink(
-            parameters,
-            self.OUTPUT,
-            context,
-            out_fields,
-            source.wkbType(),
-            source.crs(),
-        )
+            pr.addAttributes(QgsField(fname, ftype))
+        
+        source.updateFields()
+        idx_1 = source.fields().lookupField('elev_start
+        idx_2 = source.fields().lookupField('elev_end')
+        idx_3 = source.fields().lookupField('grade')    
+        idx_4 = source.fields().lookupField('grade_abs')    
+
  
         # ---- calcul de la pente par arête ----
         feedback.pushInfo("Étape 3/3 : calcul de la pente par tronçon...")
@@ -240,12 +241,7 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
             if feedback.isCanceled():
                 return {}
             geom = feat.geometry()
-            new_feat = QgsFeature(out_fields)
-            new_feat.setGeometry(geom)
-            attrs = feat.attributes()
- 
             elev_start = elev_end = length_m = grade = grade_abs = None
- 
             if geom is not None and not geom.isEmpty():
                 p_start, p_end = self._endpoints(geom)
                 if p_start is not None:
@@ -269,10 +265,12 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
                             grade *= 100.0
                         grade_abs = abs(grade)
  
-            new_feat.setAttributes(
-                attrs + [elev_start, elev_end, grade, grade_abs]
-            )
-            sink.addFeature(new_feat, QgsFeatureSink.FastInsert)
+            
+            pr.changeAttributeValues({feature.id():{idx_1: elev_start,
+                                                    idx_2: elev_end,
+                                                    idx_3: grade,
+                                                    idx_4: grade_abs}})
+            
             feedback.setProgress(60 + int(40 * i / total))
  
         if n_missing_dem:
@@ -282,7 +280,7 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
             )
             
         raster = processing.run("gdal:rasterize", 
-                       {'INPUT': inp,
+                       {'INPUT': dest_id,
                         'FIELD':'densité',
                         'BURN':0,
                         'USE_Z':False,
@@ -293,5 +291,21 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
                         'DATA_TYPE':5,'INIT':None,
                         'INVERT':False,'EXTRA':'',
                         'OUTPUT':'memory:'})['OUTPUT']
+        
+        result = processing.run("gdal:rastercalculator", 
+                       {'INPUT_A':raster,
+                        'BAND_A':1,
+                        'INPUT_B':None,'BAND_B':None,
+                        'INPUT_C':None,'BAND_C':None,
+                        'INPUT_D':None,'BAND_D':None,
+                        'INPUT_E':None,'BAND_E':None,
+                        'INPUT_F':None,'BAND_F':None,
+                        'FORMULA':'IF(A<3,100,IF(A>8,0,((A - 3) / (8-3)*100)))',
+                        'NO_DATA':None,
+                        'EXTENT_OPT':0,'PROJWIN':None,
+                        'RTYPE':5,'CREATION_OPTIONS':None,
+                        'EXTRA':'',
+                        'OUTPUT':'memory:'})
+        
  
-        return {self.OUTPUT: dest_id}
+        return {self.OUTPUT: raster}

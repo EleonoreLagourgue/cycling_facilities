@@ -177,7 +177,7 @@ class Rasterisation(QgsProcessingAlgorithm):
                         'INPUT_D':None,'BAND_D':None,
                         'INPUT_E':None,'BAND_E':None,
                         'INPUT_F':None,'BAND_F':None,
-                        'FORMULA':'(A - A.min()) / (A.max() - A.min())',
+                        'FORMULA':'((A - A.min()) / (A.max() - A.min()))*100',
                         'NO_DATA':None,
                         'EXTENT_OPT':0,'PROJWIN':None,
                         'RTYPE':5,'CREATION_OPTIONS':None,

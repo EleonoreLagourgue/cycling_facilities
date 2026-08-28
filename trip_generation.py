@@ -53,6 +53,11 @@ from qgis.analysis import (
     QgsGraphAnalyzer
 )
 from qgis import processing
+from cycling_facilities.conversions import ( 
+                         gdf_geom_to_qgs_wkbtype,
+                         gdf_to_qgsfields,
+                         write_gdf_to_sink,
+                         gdf_from_layer_arrow)
 
 from collections import OrderedDict, defaultdict
 from scipy.spatial import cKDTree
@@ -85,6 +90,7 @@ class TripGeneration(QgsProcessingAlgorithm):
     
     SERVICES = 'SERVICES'
     IDSERV = 'IDSERV'
+    CATE='CATE'
     
     DIRECTION_FIELD = 'DIRECTION_FIELD'
     VALUE_FORWARD = 'VALUE_FORWARD'
@@ -219,10 +225,18 @@ class TripGeneration(QgsProcessingAlgorithm):
         )                  
         self.addParameter(
             QgsProcessingParameterField(self.IDSERV, 
-                                               "Colonne id pour la couche de population",
+                                               "Colonne id pour la couche de services",
                                                parentLayerParameterName=self.SERVICES,
-                                               optional = True))                          
-        self.addParameter(QgsProcessingParameterNumber(self.TOLERANCE, self.tr("Tolérance topologique (en mètres)"), defaultValue=0.0))
+                                               optional = True))
+        self.addParameter(
+            QgsProcessingParameterField(self.CATE, 
+                                               "Colonne catégories des services (si existe), \n Ex: Santé, Education...",
+                                               parentLayerParameterName=self.SERVICES,
+                                               optional = True))                       
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.TOLERANCE, 
+                self.tr("Tolérance topologique (en mètres)"), defaultValue=0.0))
         
         self.addParameter(
             QgsProcessingParameterFeatureSink(
@@ -262,6 +276,9 @@ class TripGeneration(QgsProcessingAlgorithm):
         if (services is None and pop_column ) or (services is not None and not pop_column ):
             feedback.pushWarning(" Erreur : il manque une des deux informations \n Colonne population ou couche de services")
             exit()
+        
+        
+        
         
         test_liste = [od_matrix, origine, dest, cpt]
         res = [i for i in range(len(test_liste)) if test_liste[i] == None or not test_liste[i]]

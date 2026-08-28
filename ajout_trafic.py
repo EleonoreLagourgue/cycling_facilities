@@ -104,7 +104,7 @@ class AjoutTrafic(QgsProcessingAlgorithm):
         contain lowercase alphanumeric characters only and no spaces or other
         formatting characters.
         """
-        return 'formatage'
+        return 'Formatage'
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)

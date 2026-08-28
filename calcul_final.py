@@ -73,6 +73,11 @@ class AMC(QgsProcessingAlgorithm):
     POIDS_VIT = 'POIDS_VIT'
     PENTE = 'PENTE'
     POIDS_PEN = 'POIDS_PEN'
+    
+    POP = 'POP'
+    POIDS_POP ='POIDS_POP'
+    
+    ROUTES = 'ROUTES'
 
 
     
@@ -122,18 +127,7 @@ class AMC(QgsProcessingAlgorithm):
 
         # We add the input vector features source. It can have any kind of
         # geometry.
-        self.addParameter(
-            QgsProcessingParameterFeatureSource(
-                self.ACCIDENTS,
-                self.tr('Raster d"accidents'),
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.POIDS_ACC,
-                self.tr('Poids des accidents'),
-            )
-        )
+        
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT,
@@ -144,6 +138,19 @@ class AMC(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.POIDS_TRA,
                 self.tr('Poids du trafic'),
+            )
+        )
+        
+        self.addParameter(
+            QgsProcessingParameterFeatureSource(
+                self.ACCIDENTS,
+                self.tr('Raster d"accidents'),
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.POIDS_ACC,
+                self.tr('Poids des accidents'),
             )
         )
         
@@ -162,7 +169,7 @@ class AMC(QgsProcessingAlgorithm):
         
         self.addParameter(
             QgsProcessingParameterFeatureSource(
-                self.VITESE,
+                self.VITESSE,
                 self.tr('Raster de vitesse'),
             )
         )
@@ -172,7 +179,39 @@ class AMC(QgsProcessingAlgorithm):
                 self.tr('Poids de la vitesse'),
             )
         )
-    
+        
+        self.addParameter(
+            QgsProcessingParameterFeatureSource(
+                self.PENTE,
+                self.tr('Raster de pente'),
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.POIDS_PEN,
+                self.tr('Poids de la pente'),
+            )
+        )
+        
+        self.addParameter(
+            QgsProcessingParameterFeatureSource(
+                self.POP,
+                self.tr('Raster de population'),
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.POIDS_POP,
+                self.tr('Poids de la population'),
+            )
+        )
+        
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT,
+                'Couche de résultat'
+            )
+        )
     
     def processAlgorithm(self, parameters, context, feedback):
         """
@@ -182,18 +221,38 @@ class AMC(QgsProcessingAlgorithm):
         # Retrieve the feature source and sink. The 'dest_id' variable is used
         # to uniquely identify the feature sink, and must be included in the
         # dictionary returned by the processAlgorithm function.
+        
+        # Variables d'environnement
         trafic = self.parameterAsSource(parameters, self.INPUT, context)
         poids_trafic = self.parameterAsDouble(parameters, self.POIDS_TRA, context)
+        accidents = self.parameterAsSource(parameters, self.ACCIDENTS, context)
+        poids_accident = self.parameterAsDouble(parameters, self.POIDS_ACC, context)
+        
+        reseau = self.parameterAsSource(parameters, self.RESEAU, context)
+        poids_reseau = self.parameterAsDouble(parameters, self.POIDS_RES, context)
+        vitesse = self.parameterAsSource(parameters, self.VITESSE, context)
+        poids_vitesse = self.parameterAsDouble(parameters, self.POIDS_VIT, context)
+        pente = self.parameterAsSource(parameters, self.PENTE, context)
+        poids_pente = self.parameterAsDouble(parameters, self.POIDS_PEN, context)
+        
+        # Demande
+        pop = self.parameterAsSource(parameters, self.POP, context)
+        poids_pop = self.parameterAsDouble(parameters, self.POIDS_POP, context)
         
         
         
         
-        processing.run("native:rastercalc", 
+        
+        
+        
+        result = processing.run("native:rastercalc", 
                        {'LAYERS':
                         [trafic,''],
-                        'EXPRESSION':f'{trafic} * {poids_trafic}',
+                        'EXPRESSION':
+f'{trafic}*{poids_trafic} + {poids_accident}*{accidents} + {reseau}*{poids_reseau}+{vitesse}*{poids_vitesse} + {pente}*{poids_pente} + {pop}*{poids_pop}',
                         'EXTENT':None,
                         'CELL_SIZE':None,
                         'CRS':None,
                         'CREATION_OPTIONS':None,
                         'OUTPUT':'memory:'})
+        return {self.OUTPUT: result['OUTPUT']}

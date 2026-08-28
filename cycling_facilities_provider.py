@@ -39,6 +39,7 @@ from .rasteriser import Rasterisation
 from .pente import AddGradeAlgorithm
 from .rasteriser_pop import RasterisationPop
 from .cate_poi import CateServices
+from .attractivite_segment import TripGenerationProcessor
 
 class CyclingFacilitiesProvider(QgsProcessingProvider):
 
@@ -61,12 +62,13 @@ class CyclingFacilitiesProvider(QgsProcessingProvider):
         """
         self.addAlgorithm(AjoutTrafic())
         self.addAlgorithm(AMC())
-        self.addAlgorithm(TripGeneration())
+        #self.addAlgorithm(TripGeneration())
         self.addAlgorithm(AnalyseExistant())
         self.addAlgorithm(Rasterisation())
         self.addAlgorithm(AddGradeAlgorithm())
         self.addAlgorithm(RasterisationPop())
         self.addAlgorithm(CateServices())
+        self.addAlgorithm(TripGenerationProcessor())
 
     def id(self):
         """

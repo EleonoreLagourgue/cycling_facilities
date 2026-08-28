@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Created on Tue Aug 25 17:07:48 2026
+Created on Fri Aug 28 15:52:42 2026
 
-@author: eleonore.lagourgue
-"""
 
-"""
 /***************************************************************************
  CyclingFacilities
                                  A QGIS plugin
@@ -53,9 +50,9 @@ from qgis.core import (
 from qgis import processing
 from osgeo import gdal, ogr
 
-class TripGenerationProcessor(QgsProcessingAlgorithm):
+class RasteriserAccidents(QgsProcessingAlgorithm):
     ROADS = 'ROADS'
-    POIS = 'POIS'
+    ACCIDENTS = 'ACCIDENTS'
     POPULATION = 'POPULATION'
     OUTPUT = 'OUTPUT'
     def name(self):
@@ -91,7 +88,7 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
         return QCoreApplication.translate('Processing', string)
 
     def createInstance(self):
-        return TripGenerationProcessor()
+        return RasteriserAccidents()
     def initAlgorithm(self, config=None):
         # Couche du réseau routier (lignes)
         self.addParameter(
@@ -102,7 +99,7 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
         # Points d'intérêt / Générateurs de trafic (points)
         self.addParameter(
             QgsProcessingParameterVectorLayer(
-                self.POIS, 'Points Générateurs de Trafic (PNT)', [QgsProcessing.TypeVectorPoint]
+                self.ACCIDENTS, 'Points des accidents', [QgsProcessing.TypeVectorPoint]
             )
         )
         # # Couche de population (carroyage ou polygones)
@@ -120,8 +117,7 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
 
     def processAlgorithm(self, parameters, context, feedback):
         lignes = self.parameterAsVectorLayer(parameters, self.ROADS, context)
-        pois = self.parameterAsVectorLayer(parameters, self.POIS, context)
-        pop = self.parameterAsVectorLayer(parameters, self.POPULATION, context)
+        pois = self.parameterAsVectorLayer(parameters, self.ACCIDENTS, context)
 
         #1. Densité de Kernel (KDE) pour la génération de trafic PNT
         feedback.pushInfo("Calcul de la densité des PNT...")
@@ -129,23 +125,29 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
             'INPUT': pois,
             'RADIUS': 1000, # Rayon de 1 km d'attractivité
             'PIXEL_SIZE': 10,
-            'WEIGHT_FIELD': 'poids', # Poids selon le type de POI (ex: gare=3, commerce=1)
-            'OUTPUT': QgsProcessingUtils.generateTempFilename('kde_pois.tif')
+            'WEIGHT_FIELD': '', # Poids selon le type de POI (ex: gare=3, commerce=1)
+            'OUTPUT': QgsProcessingUtils.generateTempFilename('kde_accidents.tif')
         }, context=context, feedback=feedback)
 
         #2. Statistiques de zone sur les segments routiers (Attribution du score PNT)
         feedback.pushInfo("Attribution des scores d'attractivité aux tronçons...")
-        
-        
-        
-        # roads_with_pois = processing.run("native:zonalstatisticsfb", {
-        #     'INPUT_RASTER': kde_result['OUTPUT'],
-        #     'RASTER_BAND': 1,
-        #     'INPUT': lignes,
-        #     'COLUMN_PREFIX': 'score_accidents',
-        #     'STATISTICS': [2], # Moyenne (Mean)
-        #     'OUTPUT': 'memory:'
-        # }, context=context, feedback=feedback)['OUTPUT']
+        li_buffer = processing.run("native:buffer", 
+                       {'INPUT':lignes,
+                        'DISTANCE':0.01,
+                        'SEGMENTS':5,
+                        'END_CAP_STYLE':0,
+                        'JOIN_STYLE':0,'MITER_LIMIT':2,
+                        'DISSOLVE':False,
+                        'SEPARATE_DISJOINT':False,
+                        'OUTPUT':'memory:'})['OUTPUT']
+        roads_with_services = processing.run("native:zonalstatisticsfb", {
+            'INPUT_RASTER': kde_result['OUTPUT'],
+            'RASTER_BAND': 1,
+            'INPUT': li_buffer,
+            'COLUMN_PREFIX': 'poi_score_',
+            'STATISTICS': [2], # Moyenne (Mean)
+            'OUTPUT': 'memory:'
+        }, context=context, feedback=feedback)['OUTPUT']
         
         
         kde_raster_path = kde_result['OUTPUT']
