@@ -146,7 +146,12 @@ class AjoutTrafic(QgsProcessingAlgorithm):
                                                        optional=True))
        
         
-        self.addParameter(QgsProcessingParameterNumber(self.MAXDIST, self.tr("Distance maximum entre les entités"), defaultValue=0.0))
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.MAXDIST, 
+                self.tr("Distance maximum entre les entités"),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=0.1))
 
         # We add a feature sink in which to store our processed features (this
         # usually takes the form of a newly created vector layer when the
@@ -166,24 +171,38 @@ class AjoutTrafic(QgsProcessingAlgorithm):
         # Retrieve the feature source and sink. The 'dest_id' variable is used
         # to uniquely identify the feature sink, and must be included in the
         # dictionary returned by the processAlgorithm function.
-        source = self.parameterAsSource(parameters, self.INPUT, context)
-        reseau = self.parameterAsSource(parameters, self.RESEAU, context)
+        source = self.parameterAsVectorLayer(parameters, self.INPUT, context)
+        reseau = self.parameterAsVectorLayer(parameters, self.RESEAU, context)
         
-        max_dist  = self.parameterAsDouble(parameters, self.DISTANCE_MAX, context)  # tolérance en unités de la couche
+        max_dist  = self.parameterAsDouble(parameters, self.MAXDIST, context)  # tolérance en unités de la couche
         field_trafic = self.parameterAsString(parameters, self.SPEED_FIELD, context)
         field_nom = self.parameterAsString(parameters, self.DIRECTION_FIELD, context)
-        field_pl = self.parameterAsString(parameters, self.DEFAULT_SPEED, context)
+        field_pl = self.parameterAsString(parameters, self.TRAFIC_PL, context)
 
-        (sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT,
-                context, source.fields(), source.wkbType(), source.sourceCrs())
+
         
         
+        pr = source.dataProvider()
+        existing = set(source.fields().names())
+        to_add =[]
+        if 'pos_key' not in existing:
+            to_add = [           
+              QgsField('pos_key', QVariant.String)            
+                  ]
+        
+        #to_add = [QgsField('pos_key', QVariant.String) if 'pos_key' not in existing]
+        if to_add:
+            pr.addAttributes(to_add)
+            source.updateFields()
+            feedback.pushInfo(f"Added:, {[f.name() for f in to_add]}")
+        else:
+            feedback.pushInfo("Rien à ajouter")
+        
+        print(source.fields().names())
+        idx_key = source.fields().indexOf('pos_key')
+    
         source.startEditing()
-        source.dataProvider().addAttributes([QgsField('position_key', QVariant.String)])
-        source.updateFields()
-        idx_key = source.fields().indexOf('position_key')
-    
-    
+
         precision=6
         groups = {}
         for feat in source.getFeatures():
@@ -195,82 +214,59 @@ class AjoutTrafic(QgsProcessingAlgorithm):
         
             
         source.commitChanges()
-        merged_features = []
-        for key, feats in groups.items():
-            values = [f[field_trafic] for f in feats if f[field_trafic] not in (None,)]
-            mean_val = sum(values) / len(values) if values else None
-     
-            new_feat = QgsFeature(feats[0].fields())
-            new_feat.setGeometry(feats[0].geometry())
-            new_feat.setAttributes(feats[0].attributes())
-            new_feat.setAttribute(field_trafic, mean_val)
-            merged_features.append(new_feat)
         
+        aggregates = [
+            {
+                'aggregate': 'mean',
+                'delimiter': ',',
+                'input': field_trafic,
+                'length': 11,
+                'name': field_trafic,
+                'precision': 2,
+                'sub_type': 0,
+                'type': 6,  # Double
+                'type_name': 'double'
+            }
+        ]
+
+        if field_pl:
+            aggregates.append({
+                'aggregate': 'sum',
+                'delimiter': ',',
+                'input': field_pl,
+                'length': 11,
+                'name': field_pl,
+                'precision': 2,
+                'sub_type': 0,
+                'type': 6,
+                'type_name': 'double'
+            })
         cpt_aggre = processing.run("native:aggregate", 
                        {'INPUT': source,
-                        'GROUP_BY':'position_key',
-                        'AGGREGATES':[
-                            {
-                            'aggregate': 'first_value',
-                            'delimiter': ',',
-                            'input': 'position_key',
-                            'length': 0,
-                            'name': 'position_key',
-                            'precision': 0,
-                            'type': 10
-                            },  
-                            {'aggregate': 'first_value',
-                                       'delimiter': ',',
-                                       'input': '"AXE"',
-                                       'length': 30,
-                                       'name': 'AXE','precision': 0,
-                                       'sub_type': 0,'type': 10,'type_name': 'text'},
-                                      {'aggregate': 'first_value',
-                                       'delimiter': ',','input': '"TYPE_COMPT"',
-                                       'length': 20,'name': 'TYPE_COMPT',
-                                       'precision': 0,'sub_type': 0,'type': 10,'type_name': 'text'},
-                                      {'aggregate': 'sum','delimiter': ',',
-                                       'input': '"TRAFIC_VL"','length': 11,'name': 'TRAFIC_VL',
-                                       'precision': 0,'sub_type': 0,'type': 4,
-                                       'type_name': 'int8'},
-                                      {'aggregate': 'maximum','delimiter': ',',
-                                       'input': '"ANNEE"','length': 11,'name': 'ANNEE',
-                                       'precision': 0,'sub_type': 0,'type': 4,
-                                       'type_name': 'int8'},
-                                      {'aggregate': 'mean','delimiter': ',',
-                                       'input': field_trafic,'length': 11,'name': field_trafic,
-                                       'precision': 0,'sub_type': 0,'type': 4,
-                                       'type_name': 'int8'},
-                                      {'aggregate': 'sum','delimiter': ',',
-                                       'input': '"PART_PL"','length': 8,'name': 'PART_PL',
-                                       'precision': 2,'sub_type': 0,'type': 6,
-                                       'type_name': 'double precision'},
-                                      {'aggregate': 'sum','delimiter': ',',
-                                       'input': '"TRAFIC_PL"','length': 11,'name': 'TRAFIC_PL',
-                                       'precision': 0,'sub_type': 0,'type': 4,
-                                       'type_name': 'int8'},
-                                      {'aggregate': 'concatenate','delimiter': ',',
-                                       'input': '"CODE"','length': 25,'name': 'CODE',
-                                       'precision': 0,'sub_type': 0,'type': 10,
-                                       'type_name': 'text'}],
+                        'GROUP_BY':'geom_to_wkb($geometry)',
+                        'AGGREGATES':aggregates,
                         'OUTPUT':'memory:compteurs_moyennes'
                         },  context=context, feedback=feedback)['OUTPUT']
-        
-
+        feedback.pushInfo(str(cpt_aggre.featureCount()))
+        # for feat in source.getFeatures():
+        #     geom =feat.geometry()
+        #     pt = geom.asPoint()  
+            
         result = processing.run("native:joinbynearest", 
-                       {'INPUT':reseau,'INPUT_2': source,
+                       {'INPUT':reseau,'INPUT_2': cpt_aggre,
                         'FIELDS_TO_COPY':[],
                         'DISCARD_NONMATCHING':False,
                         'PREFIX':'','NEIGHBORS':1,
-                        'MAX_DISTANCE':max_dist,'OUTPUT': 'memory'}
+                        'MAX_DISTANCE':max_dist,'OUTPUT': 'memory:'}
                        , context=context, feedback=feedback)['OUTPUT']
         
         idx_trafic = result.fields().indexOf(field_trafic)
-        idx_nom = result.fields().indexOf(field_nom)
+        #idx_nom = result.fields().indexOf(field_nom)
     
         feats = {f.id(): f for f in result.getFeatures()}
     
         def endpoints(fid):
+            # Trouve les points de début et de fin
             geom = feats[fid].geometry()
             line = geom.asMultiPolyline()[0] if geom.isMultipart() else geom.asPolyline()
             return (line[0], line[-1])
@@ -330,5 +326,5 @@ class AjoutTrafic(QgsProcessingAlgorithm):
         # statistics, etc. These should all be included in the returned
         # dictionary, with keys matching the feature corresponding parameter
         # or output names.
-        return {self.OUTPUT: dest_id}
+        return {}
 

@@ -56,7 +56,7 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
     POPULATION = 'POPULATION'
     OUTPUT = 'OUTPUT'
     def name(self):
-        return 'Calcul attractivité aux services'
+        return "Calcul concentration d'accidents"
 
     
 
@@ -119,7 +119,7 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
         lignes = self.parameterAsVectorLayer(parameters, self.ROADS, context)
         pois = self.parameterAsVectorLayer(parameters, self.ACCIDENTS, context)
 
-        #1. Densité de Kernel (KDE) pour la génération de trafic PNT
+        #1. Densité de Kernel/carte de chaleur  pour les accidents
         feedback.pushInfo("Calcul de la densité des PNT...")
         kde_result = processing.run("qgis:heatmapkerneldensityestimation", {
             'INPUT': pois,
@@ -131,23 +131,8 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
 
         #2. Statistiques de zone sur les segments routiers (Attribution du score PNT)
         feedback.pushInfo("Attribution des scores d'attractivité aux tronçons...")
-        li_buffer = processing.run("native:buffer", 
-                       {'INPUT':lignes,
-                        'DISTANCE':0.01,
-                        'SEGMENTS':5,
-                        'END_CAP_STYLE':0,
-                        'JOIN_STYLE':0,'MITER_LIMIT':2,
-                        'DISSOLVE':False,
-                        'SEPARATE_DISJOINT':False,
-                        'OUTPUT':'memory:'})['OUTPUT']
-        roads_with_services = processing.run("native:zonalstatisticsfb", {
-            'INPUT_RASTER': kde_result['OUTPUT'],
-            'RASTER_BAND': 1,
-            'INPUT': li_buffer,
-            'COLUMN_PREFIX': 'poi_score_',
-            'STATISTICS': [2], # Moyenne (Mean)
-            'OUTPUT': 'memory:'
-        }, context=context, feedback=feedback)['OUTPUT']
+        
+
         
         
         kde_raster_path = kde_result['OUTPUT']
@@ -220,7 +205,7 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
                     'DATA_TYPE':5,'INIT':None,
                     'INVERT':False,'EXTRA':'',
                     'OUTPUT':'memory:'})['OUTPUT']
-        result = processing.run("gdal:rastercalculator", 
+        calcul = processing.run("gdal:rastercalculator", 
                        {'INPUT_A':raster,
                         'BAND_A':1,
                         'INPUT_B':None,'BAND_B':None,
@@ -234,7 +219,7 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
                         'RTYPE':5,'CREATION_OPTIONS':None,
                         'EXTRA':'',
                         'OUTPUT':parameters[self.OUTPUT]})
-
-        return {self.OUTPUT: result['OUTPUT']}
+        
+        return {self.OUTPUT: calcul['OUTPUT']}
 
     

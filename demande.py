@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
-
 """
+Created on Mon Aug 31 12:57:17 2026
+
+
 /***************************************************************************
  CyclingFacilities
                                  A QGIS plugin
@@ -34,14 +36,16 @@ from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
                        QgsProcessingAlgorithm,
-                       QgsProcessingParameterRasterLayer,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterRasterDestination,
                        QgsProcessingParameterFeatureSink,
+                       QgsProcessingParameterRasterLayer,
                        QgsProcessingParameterField,
                        QgsProcessingParameterString,
                        QgsProcessingParameterEnum, 
-                       QgsProcessingParameterNumber)
+                       QgsProcessingParameterNumber,
+                       QgsField,
+                       QgsFeature)
 
 from qgis.analysis import (
     QgsVectorLayerDirector,
@@ -53,8 +57,7 @@ from qgis.analysis import (
 from qgis import processing
 
 
-
-class AMC(QgsProcessingAlgorithm):
+class Demande(QgsProcessingAlgorithm):
     """
     Algorithme pour calculer le résultat final.
     Retourne un raster
@@ -66,17 +69,15 @@ class AMC(QgsProcessingAlgorithm):
 
     OUTPUT = 'OUTPUT'
     
-    
-    RESEAU = 'RESEAU'
-    POIDS_RES = 'POIDS_RES'
-    
-    PENTE = 'PENTE'
-    POIDS_PEN = 'POIDS_PEN'
-    
-    
-    ROUTES = 'ROUTES'
+    PNT = 'PNT'
+    POIDS_PNT = 'POIDS_PNT'
 
+    POP = 'POP'
+    POIDS_POP ='POIDS_POP'
 
+    
+    
+    
     
     def name(self):
         """
@@ -86,7 +87,7 @@ class AMC(QgsProcessingAlgorithm):
         lowercase alphanumeric characters only and no spaces or other
         formatting characters.
         """
-        return 'Calcul final'
+        return "Calcul du potentiel de demande des routes"
 
     def displayName(self):
         """
@@ -116,8 +117,7 @@ class AMC(QgsProcessingAlgorithm):
         return QCoreApplication.translate('Processing', string)
 
     def createInstance(self):
-        return AMC()
-    
+        return Demande()
     
     def initAlgorithm(self, config):
         
@@ -125,25 +125,37 @@ class AMC(QgsProcessingAlgorithm):
         # We add the input vector features source. It can have any kind of
         # geometry.
         
-        
-        
-        
         self.addParameter(
             QgsProcessingParameterRasterLayer(
-                self.RESEAU,
-                self.tr('Raster de connectivité réseau'),
+                self.PNT,
+                self.tr('Raster des services'),
             )
         )
         self.addParameter(
             QgsProcessingParameterNumber(
-                self.POIDS_RES,
-                self.tr('Poids de connectivité réseau'),
+                self.POIDS_PNT,
+                self.tr('Poids des services'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=0.5,
+                minValue=0.0,
             )
         )
         
-        
-        
-        
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                self.POP,
+                self.tr('Raster de population'),
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.POIDS_POP,
+                self.tr('Poids de la population'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=0.5,
+                minValue=0.0,
+            )
+        )
         
         self.addParameter(
             QgsProcessingParameterRasterDestination(
@@ -151,7 +163,8 @@ class AMC(QgsProcessingAlgorithm):
                 'Couche de résultat'
             )
         )
-    
+        
+        
     def processAlgorithm(self, parameters, context, feedback):
         """
         Here is where the processing itself takes place.
@@ -161,21 +174,28 @@ class AMC(QgsProcessingAlgorithm):
         # to uniquely identify the feature sink, and must be included in the
         # dictionary returned by the processAlgorithm function.
         
-        # Variables d'environnement
-        trafic = self.parameterAsSource(parameters, self.INPUT, context)
+        pnt = self.parameterAsSource(parameters, self.PNT, context)
+        poids_pnt = self.parameterAsDouble(parameters, self.POIDS_PNT, context)
+        
+        pop = self.parameterAsSource(parameters, self.POP, context)
+        poids_pop = self.parameterAsDouble(parameters, self.POIDS_POP, context)
         
         
-        
-        
-        
-        
-        result = processing.run("native:rastercalc", 
+        processing.run("native:rastercalc", 
                        {'LAYERS':
-                        [trafic,''],
-                        'EXPRESSION':'',
-                        'EXTENT':None,
-                        'CELL_SIZE':None,
-                        'CRS':None,
-                        'CREATION_OPTIONS':None,
+                    ['C:/Users/eleonore.lagourgue/Documents/stage_Eleonore/Sujet1_cyclable/donnees/donnees_creees/MNT_pente.tif',
+                     'wms://http-header:referer=&type=xyz&url=https://tile.openstreetmap.org/%7Bz%7D/%7Bx%7D/%7By%7D.png&zmax=19&zmin=0'],
+                    'EXPRESSION':'"MNT_pente@1" * 0.5 + "OpenStreetMap@1" * 0.5',
+                    'EXTENT':None,'CELL_SIZE':None,
+                    'CRS':None,'CREATION_OPTIONS':None,
+                    'OUTPUT':'TEMPORARY_OUTPUT'})
+        result = processing.run("gdal:rastercalculatorc", 
+                       {"INPUT_A": pop, "BAND_A": 1,
+                        "INPUT_B": pnt, "BAND_B": 1,
+                        'EXPRESSION':f'{pop}*{poids_pop} + {pnt}*{poids_pnt} ',
+                        "FORMULA": f"({poids_pop}*A + {poids_pnt}*B)",
+                        "NO_DATA": -9999, 'PROJWIN':None,
+                        'RTYPE':5,'CREATION_OPTIONS':None,
+                        'EXTRA':'',
                         'OUTPUT':parameters[self.OUTPUT]})
         return {self.OUTPUT: result['OUTPUT']}

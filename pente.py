@@ -217,7 +217,7 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
         pr = source.dataProvider()
         source.startEditing()
         
-        out_fields = QgsFields(source.fields())
+        #out_fields = QgsFields(source.fields())
         for fname, ftype in (
             ("elev_start", QVariant.Double),
             ("elev_end", QVariant.Double),
@@ -228,7 +228,7 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
             pr.addAttributes(QgsField(fname, ftype))
         
         source.updateFields()
-        idx_1 = source.fields().lookupField('elev_start
+        idx_1 = source.fields().lookupField('elev_start')
         idx_2 = source.fields().lookupField('elev_end')
         idx_3 = source.fields().lookupField('grade')    
         idx_4 = source.fields().lookupField('grade_abs')    
@@ -266,7 +266,7 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
                         grade_abs = abs(grade)
  
             
-            pr.changeAttributeValues({feature.id():{idx_1: elev_start,
+            pr.changeAttributeValues({feat.id():{idx_1: elev_start,
                                                     idx_2: elev_end,
                                                     idx_3: grade,
                                                     idx_4: grade_abs}})
@@ -280,7 +280,7 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
             )
             
         raster = processing.run("gdal:rasterize", 
-                       {'INPUT': dest_id,
+                       {'INPUT': source,
                         'FIELD':'densité',
                         'BURN':0,
                         'USE_Z':False,
@@ -305,7 +305,7 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
                         'EXTENT_OPT':0,'PROJWIN':None,
                         'RTYPE':5,'CREATION_OPTIONS':None,
                         'EXTRA':'',
-                        'OUTPUT':'memory:'})
+                        'OUTPUT':parameters[self.OUTPUT]})
         
  
-        return {self.OUTPUT: raster}
+        return {self.OUTPUT: result}

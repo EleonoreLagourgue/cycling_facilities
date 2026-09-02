@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
-
 """
+Created on Mon Aug 31 12:57:17 2026
+
+
 /***************************************************************************
  CyclingFacilities
                                  A QGIS plugin
@@ -34,14 +36,16 @@ from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
                        QgsProcessingAlgorithm,
-                       QgsProcessingParameterRasterLayer,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterRasterDestination,
+                       QgsProcessingParameterRasterLayer,
                        QgsProcessingParameterFeatureSink,
                        QgsProcessingParameterField,
                        QgsProcessingParameterString,
                        QgsProcessingParameterEnum, 
-                       QgsProcessingParameterNumber)
+                       QgsProcessingParameterNumber,
+                       QgsField,
+                       QgsFeature)
 
 from qgis.analysis import (
     QgsVectorLayerDirector,
@@ -53,8 +57,7 @@ from qgis.analysis import (
 from qgis import processing
 
 
-
-class AMC(QgsProcessingAlgorithm):
+class BLOS(QgsProcessingAlgorithm):
     """
     Algorithme pour calculer le résultat final.
     Retourne un raster
@@ -66,17 +69,30 @@ class AMC(QgsProcessingAlgorithm):
 
     OUTPUT = 'OUTPUT'
     
-    
-    RESEAU = 'RESEAU'
-    POIDS_RES = 'POIDS_RES'
+    TRAFIC = 'TRAFIC'
+    POIDS_TRA = 'POIDS_TRA'
+
+    TRAFIC_PL ='TRAFIC_PL'
+    POIDS_PL = 'POIDS_PL'
+
+    NB_VOIES = 'NB_VOIES'
+    POIDS_NB = 'POIDS_NB'
+
+    VITESSE = 'VITESSE'
+    POIDS_VIT = 'POIDS_VIT'
+
+    LARG_ROUTE = 'LARG_ROUTE'
+    POIDS_LAR = 'POIDS_LAR'
     
     PENTE = 'PENTE'
     POIDS_PEN = 'POIDS_PEN'
     
+    ACCIDENTS = 'ACCIDENTS'
+    POIDS_ACC = 'POIDS_ACC'
+
+
     
-    ROUTES = 'ROUTES'
-
-
+    
     
     def name(self):
         """
@@ -86,7 +102,7 @@ class AMC(QgsProcessingAlgorithm):
         lowercase alphanumeric characters only and no spaces or other
         formatting characters.
         """
-        return 'Calcul final'
+        return "Calcul du potentiel d'offre des routes"
 
     def displayName(self):
         """
@@ -116,8 +132,7 @@ class AMC(QgsProcessingAlgorithm):
         return QCoreApplication.translate('Processing', string)
 
     def createInstance(self):
-        return AMC()
-    
+        return BLOS()
     
     def initAlgorithm(self, config):
         
@@ -125,25 +140,85 @@ class AMC(QgsProcessingAlgorithm):
         # We add the input vector features source. It can have any kind of
         # geometry.
         
-        
-        
-        
         self.addParameter(
             QgsProcessingParameterRasterLayer(
-                self.RESEAU,
-                self.tr('Raster de connectivité réseau'),
+                self.TRAFIC,
+                self.tr('Raster de trafic'),
             )
         )
         self.addParameter(
             QgsProcessingParameterNumber(
-                self.POIDS_RES,
-                self.tr('Poids de connectivité réseau'),
+                self.POIDS_TRA,
+                self.tr('Poids du trafic'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=0.5,
+                minValue=0.0,
             )
         )
         
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                self.ACCIDENTS,
+                self.tr('Raster d"accidents'),
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.POIDS_ACC,
+                self.tr('Poids des accidents'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=0.5,
+                minValue=0.0,
+            )
+        )
         
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                self.TRAFIC_PL,
+                self.tr('Raster du trafic de poids lourds'),
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.POIDS_PL,
+                self.tr('Poids pour les PL'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=0.5,
+                minValue=0.0,
+            )
+        )
         
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                self.VITESSE,
+                self.tr('Raster de vitesse'),
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.POIDS_VIT,
+                self.tr('Poids de la vitesse'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=0.5,
+                minValue=0.0,
+            )
+        )
         
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                self.PENTE,
+                self.tr('Raster de pente'),
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.POIDS_PEN,
+                self.tr('Poids de la pente'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=0.5,
+                minValue=0.0,
+            )
+        )
         
         self.addParameter(
             QgsProcessingParameterRasterDestination(
@@ -151,7 +226,7 @@ class AMC(QgsProcessingAlgorithm):
                 'Couche de résultat'
             )
         )
-    
+        
     def processAlgorithm(self, parameters, context, feedback):
         """
         Here is where the processing itself takes place.
@@ -162,17 +237,27 @@ class AMC(QgsProcessingAlgorithm):
         # dictionary returned by the processAlgorithm function.
         
         # Variables d'environnement
-        trafic = self.parameterAsSource(parameters, self.INPUT, context)
+        trafic = self.parameterAsSource(parameters, self.TRAFIC, context)
+        poids_trafic = self.parameterAsDouble(parameters, self.POIDS_TRA, context)
+        trafic_pl = self.parameterAsSource(parameters, self.TRAFIC_PL, context)
+        poids_pl = self.parameterAsDouble(parameters, self.POIDS_PL, context)
+        accidents = self.parameterAsSource(parameters, self.ACCIDENTS, context)
+        poids_accident = self.parameterAsDouble(parameters, self.POIDS_ACC, context)
         
         
-        
+        vitesse = self.parameterAsSource(parameters, self.VITESSE, context)
+        poids_vitesse = self.parameterAsDouble(parameters, self.POIDS_VIT, context)
+        pente = self.parameterAsSource(parameters, self.PENTE, context)
+        poids_pente = self.parameterAsDouble(parameters, self.POIDS_PEN, context)
         
         
         
         result = processing.run("native:rastercalc", 
                        {'LAYERS':
-                        [trafic,''],
-                        'EXPRESSION':'',
+                        [trafic,trafic_pl, accidents,
+                          vitesse, pente],
+                        'EXPRESSION':
+f'{trafic}*{poids_trafic} + {poids_accident}*{accidents} +{vitesse}*{poids_vitesse} + {pente}*{poids_pente} + {trafic_pl}*{poids_pl}',
                         'EXTENT':None,
                         'CELL_SIZE':None,
                         'CRS':None,

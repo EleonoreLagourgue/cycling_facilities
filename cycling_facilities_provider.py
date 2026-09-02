@@ -33,13 +33,15 @@ __revision__ = '$Format:%H$'
 from qgis.core import QgsProcessingProvider
 from .ajout_trafic import AjoutTrafic
 from .calcul_final import AMC
-from .trip_generation import TripGeneration
 from .analyse_existant import AnalyseExistant
 from .rasteriser import Rasterisation
 from .pente import AddGradeAlgorithm
 from .rasteriser_pop import RasterisationPop
 from .cate_poi import CateServices
 from .attractivite_segment import TripGenerationProcessor
+from .accidents import RasteriserAccidents
+from .demande import Demande
+from .supply import BLOS
 
 class CyclingFacilitiesProvider(QgsProcessingProvider):
 
@@ -69,6 +71,11 @@ class CyclingFacilitiesProvider(QgsProcessingProvider):
         self.addAlgorithm(RasterisationPop())
         self.addAlgorithm(CateServices())
         self.addAlgorithm(TripGenerationProcessor())
+        self.addAlgorithm(RasteriserAccidents())
+        self.addAlgorithm(Demande())
+        self.addAlgorithm(BLOS())
+
+
 
     def id(self):
         """
