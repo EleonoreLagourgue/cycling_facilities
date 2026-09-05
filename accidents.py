@@ -41,6 +41,7 @@ from qgis.core import (
     QgsProcessingParameterRasterLayer,
     QgsProcessingParameterNumber,
     QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterRasterDestination,
     QgsProcessingUtils,
     QgsFeature,
     QgsGeometry,
@@ -49,11 +50,20 @@ from qgis.core import (
 )
 from qgis import processing
 from osgeo import gdal, ogr
+import numpy as np
+import os
+
+
+_TMP_DIR = r'C:\Users\eleonore.lagourgue\qgis_tmp'
+if os.name == 'nt':
+    os.makedirs(_TMP_DIR, exist_ok=True)
+    os.environ['TMP'] = _TMP_DIR
+    os.environ['TEMP'] = _TMP_DIR
+
 
 class RasteriserAccidents(QgsProcessingAlgorithm):
     ROADS = 'ROADS'
     ACCIDENTS = 'ACCIDENTS'
-    POPULATION = 'POPULATION'
     OUTPUT = 'OUTPUT'
     def name(self):
         return "Calcul concentration d'accidents"
@@ -102,15 +112,10 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
                 self.ACCIDENTS, 'Points des accidents', [QgsProcessing.TypeVectorPoint]
             )
         )
-        # # Couche de population (carroyage ou polygones)
-        # self.addParameter(
-        #     QgsProcessingParameterVectorLayer(
-        #         self.POPULATION, 'Densité de Population', [QgsProcessing.TypeVectorPolygon]
-        #     )
-        # )
+        
         # Sink de sortie
         self.addParameter(
-            QgsProcessingParameterFeatureSink(
+            QgsProcessingParameterRasterDestination(
                 self.OUTPUT, 'Réseau enrichi de la demande'
             )
         )
@@ -118,9 +123,17 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
     def processAlgorithm(self, parameters, context, feedback):
         lignes = self.parameterAsVectorLayer(parameters, self.ROADS, context)
         pois = self.parameterAsVectorLayer(parameters, self.ACCIDENTS, context)
+        output_raster = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
+        
+        for layer in (lignes, pois):
+            if layer.dataProvider().name() == 'ogr':
+                layer.dataProvider().setEncoding('CP1252')
+        
+        feedback.pushInfo(f"Encodage réseau routier : {lignes.dataProvider().encoding()}")
+        feedback.pushInfo(f"Encodage accidents : {pois.dataProvider().encoding()}")
 
         #1. Densité de Kernel/carte de chaleur  pour les accidents
-        feedback.pushInfo("Calcul de la densité des PNT...")
+        feedback.pushInfo("Calcul de la densité des accidents...")
         kde_result = processing.run("qgis:heatmapkerneldensityestimation", {
             'INPUT': pois,
             'RADIUS': 1000, # Rayon de 1 km d'attractivité
@@ -131,68 +144,52 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
 
         #2. Statistiques de zone sur les segments routiers (Attribution du score PNT)
         feedback.pushInfo("Attribution des scores d'attractivité aux tronçons...")
-        
-
-        
-        
         kde_raster_path = kde_result['OUTPUT']
-        src_ds = gdal.Open(kde_raster_path)
-        gt = src_ds.GetGeoTransform()
-        proj = src_ds.GetProjection()
-        cols = src_ds.RasterXSize
-        rows = src_ds.RasterYSize
-        band = src_ds.GetRasterBand(1)
-        nodata = band.GetNoDataValue()
-        src_array = band.ReadAsArray().astype(float)
-        
-        total = lignes.featureCount()
-        mem_drv = gdal.GetDriverByName('MEM')
-        mask_ds = mem_drv.Create('', cols, rows, 1, gdal.GDT_Byte)
-        mask_ds.SetGeoTransform(gt)
-        mask_ds.SetProjection(proj)
-        
         pr = lignes.dataProvider()
         lignes.startEditing()
-        pr.addAttributes([ 
+        pr.addAttributes([
+                QgsField("join_fid", QVariant.LongLong),
                 QgsField("score_services", QVariant.Double)])
         lignes.updateFields()
+        
+        idx_join = lignes.fields().lookupField('join_fid')
         idx = lignes.fields().lookupField('score_services')
-        for current, feature in enumerate(lignes.getFeatures()):
-            geom = feature.geometry()
-            
-            mem_ogr_drv = ogr.GetDriverByName('Memory')
-            mem_ogr_ds = mem_ogr_drv.CreateDataSource('mem')
-            mem_ogr_layer = mem_ogr_ds.CreateLayer('line', geom_type=ogr.wkbLineString)
-            ogr_feat = ogr.Feature(mem_ogr_layer.GetLayerDefn())
-            ogr_feat.SetGeometry(ogr.CreateGeometryFromWkt(geom.asWkt()))
-            mem_ogr_layer.CreateFeature(ogr_feat)
-
-            # Masque raster en mémoire, mêmes dimensions que le KDE
-            mask_ds = mem_drv.Create('', cols, rows, 1, gdal.GDT_Byte)
-            mask_ds.SetGeoTransform(gt)
-            mask_ds.SetProjection(proj)
-
-            gdal.RasterizeLayer(
-                mask_ds, [1], mem_ogr_layer,
-                burn_values=[1],
-                options=['ALL_TOUCHED=TRUE']
-            )# On rasterise tous les pixels qui touche la géométrie pour faire un masque
-            mask_array = mask_ds.GetRasterBand(1).ReadAsArray()
-
-            pixels_values = src_array[mask_array == 1]
-            if nodata is not None:
-                pixels_values = pixels_values[pixels_values != nodata]
-
-            score = float(pixels_values.mean()) if pixels_values.size > 0 else 0.0
-
-            
-            pr.changeAttributeValues({feature.id():{idx: score}})
-            
-
-
-            feedback.setProgress(int(current / total * 100))
+        
+        join_updates = {f.id(): {idx_join: f.id()} for f in lignes.getFeatures()}
+        pr.changeAttributeValues(join_updates)
         lignes.commitChanges()
 
+
+        buffered = processing.run("native:buffer", {
+            'INPUT': lignes,
+            'DISTANCE': 5,  
+            'SEGMENTS': 5,
+            'DISSOLVE': False,
+            'OUTPUT': 'memory:'
+        }, context=context, feedback=feedback)['OUTPUT']
+        
+        print("Buffer fait!")
+        zonal = processing.run("native:zonalstatisticsfb", {
+            'INPUT': buffered,
+            'INPUT_RASTER': kde_raster_path,
+            'RASTER_BAND': 1,
+            'COLUMN_PREFIX': 'score_',
+            'STATISTICS': [2],  #Moyenne
+            'OUTPUT': 'memory:'
+        }, context=context, feedback=feedback)['OUTPUT']
+        print("Stats zonales faites!")
+
+        
+        
+        lignes.startEditing()
+        scores = {f['join_fid']: f['score_mean'] for f in zonal.getFeatures()}
+        
+
+        updates = {f.id(): {idx: (scores.get(f['join_fid']) if scores.get(f['join_fid']) is not None else 0.0)}
+            for f in lignes.getFeatur}
+        pr.changeAttributeValues(updates)  # une seule écriture groupée au lieu d'une par entité
+        lignes.commitChanges()
+       
         raster = processing.run("gdal:rasterize", 
                    {'INPUT': lignes,
                     'FIELD':'score_services',
@@ -204,7 +201,21 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
                     'CREATION_OPTIONS':None,
                     'DATA_TYPE':5,'INIT':None,
                     'INVERT':False,'EXTRA':'',
-                    'OUTPUT':'memory:'})['OUTPUT']
+                    'OUTPUT': QgsProcessingUtils.generateTempFilename(
+                        'score_services_rasterized.tif', context)}
+                   )['OUTPUT']
+        
+        ds = gdal.Open(raster) if isinstance(raster, str) else raster
+        arr = ds.GetRasterBand(1).ReadAsArray().astype(float)
+        r_min = float(np.nanmin(arr))
+        r_max = float(np.nanmax(arr))
+        feedback.pushInfo(f"score_services min={r_min}, max={r_max}")
+        if r_max == r_min:
+            feedback.pushWarning("Toutes les valeurs sont identiques, la normalisation est ignorée.")
+            formula = "A*0"  # ou une autre valeur par défaut
+        else:
+            formula = f"((A - {r_min}) / ({r_max} - {r_min})) * 100"
+
         calcul = processing.run("gdal:rastercalculator", 
                        {'INPUT_A':raster,
                         'BAND_A':1,
@@ -213,12 +224,12 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
                         'INPUT_D':None,'BAND_D':None,
                         'INPUT_E':None,'BAND_E':None,
                         'INPUT_F':None,'BAND_F':None,
-                        'FORMULA':'((A - A.min()) / (A.max() - A.min()))*100',
+                        'FORMULA':formula,
                         'NO_DATA':None,
                         'EXTENT_OPT':0,'PROJWIN':None,
                         'RTYPE':5,'CREATION_OPTIONS':None,
                         'EXTRA':'',
-                        'OUTPUT':parameters[self.OUTPUT]})
+                        'OUTPUT':output_raster})
         
         return {self.OUTPUT: calcul['OUTPUT']}
 

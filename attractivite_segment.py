@@ -44,6 +44,7 @@ from qgis.core import (
     QgsProcessingParameterRasterLayer,
     QgsProcessingParameterNumber,
     QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterRasterDestination,
     QgsProcessingUtils,
     QgsFeature,
     QgsGeometry,
@@ -113,8 +114,8 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
         # )
         # Sink de sortie
         self.addParameter(
-            QgsProcessingParameterFeatureSink(
-                self.OUTPUT, 'Réseau enrichi de la demande'
+            QgsProcessingParameterRasterDestination(
+                self.OUTPUT, "Raster l'attractivité i.e. proximité aux services"
             )
         )
 
@@ -217,7 +218,8 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
                     'CREATION_OPTIONS':None,
                     'DATA_TYPE':5,'INIT':None,
                     'INVERT':False,'EXTRA':'',
-                    'OUTPUT':'memory:'})['OUTPUT']
+                    'OUTPUT':QgsProcessingUtils.generateTempFilename(
+                        'raster.tif', context)})['OUTPUT']
         result = processing.run("gdal:rastercalculator", 
                        {'INPUT_A':raster,
                         'BAND_A':1,

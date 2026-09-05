@@ -66,6 +66,11 @@ class AMC(QgsProcessingAlgorithm):
 
     OUTPUT = 'OUTPUT'
     
+    DEMANDE = 'DEMANDE'
+    POIDS_D = 'POIDS_D'
+    
+    OFFRE = 'OFFRE'
+    POIDS_O = 'POIDS_O'
     
     RESEAU = 'RESEAU'
     POIDS_RES = 'POIDS_RES'
@@ -141,6 +146,31 @@ class AMC(QgsProcessingAlgorithm):
             )
         )
         
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                self.DEMANDE,
+                self.tr('Raster de demande (calculé avec Calcul du potentiel de demande)'),
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.POIDS_D,
+                self.tr('Poids de la demande'),
+            )
+        )
+        
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                self.OFFRE,
+                self.tr('Raster d"offre (calculé avec Calcul du potentiel de l"offre)'),
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.POIDS_O,
+                self.tr('Poids de l"offre'),
+            )
+        )
         
         
         
@@ -162,20 +192,28 @@ class AMC(QgsProcessingAlgorithm):
         # dictionary returned by the processAlgorithm function.
         
         # Variables d'environnement
-        trafic = self.parameterAsSource(parameters, self.INPUT, context)
+        offre = self.parameterAsSource(parameters, self.OFFRE, context)
+        poids_offre = self.parameterAsDouble(parameters, self.POIDS_TRA, context)
+        demande = self.parameterAsSource(parameters, self.TRAFIC_PL, context)
+        poids_demande = self.parameterAsDouble(parameters, self.POIDS_PL, context)
+        reseau = self.parameterAsSource(parameters, self.RESEAU, context)
+        poids_reseau = self.parameterAsDouble(parameters, self.POIDS_RES, context)
         
         
         
         
+        if poids_reseau + poids_demande+poids_offre != 1:
+            feedback.reportError("La somme des scores est différente de 1 !")
         
         
-        result = processing.run("native:rastercalc", 
-                       {'LAYERS':
-                        [trafic,''],
-                        'EXPRESSION':'',
-                        'EXTENT':None,
-                        'CELL_SIZE':None,
-                        'CRS':None,
-                        'CREATION_OPTIONS':None,
-                        'OUTPUT':parameters[self.OUTPUT]})
+            
+        result = processing.run("gdal:rastercalculatorc", 
+                           {"INPUT_A": offre, "BAND_A": 1,
+                            "INPUT_B": demande, "BAND_B": 1,
+                            "INPUT_C": reseau, "BAND_C": 1,
+                            "FORMULA": f"({poids_offre}*A + {poids_demande}*B + {poids_reseau}*C)",
+                            "NO_DATA": -9999, 'PROJWIN':None,
+                            'RTYPE':5,'CREATION_OPTIONS':None,
+                            'EXTRA':'',
+                            'OUTPUT':parameters[self.OUTPUT]})
         return {self.OUTPUT: result['OUTPUT']}

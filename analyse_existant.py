@@ -30,9 +30,11 @@ __revision__ = '$Format:%H$'
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (QgsProcessing,
+                       QgsProcessingUtils,
                        QgsFeatureRequest,
                        QgsFeatureSink,
                        QgsProcessingAlgorithm,
+                       QgsProcessingParameterRasterDestination,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
                        QgsProcessingParameterField,
@@ -54,10 +56,13 @@ from qgis.analysis import (
     QgsGraphAnalyzer
 )
 from qgis import processing
+from osgeo import gdal, ogr
+
 
 from collections import OrderedDict, defaultdict
 from scipy.spatial import cKDTree
 import pandas as pd
+import numpy as np
 
 class AnalyseExistant(QgsProcessingAlgorithm):
     """
@@ -120,15 +125,15 @@ class AnalyseExistant(QgsProcessingAlgorithm):
         )
         
         self.addParameter(QgsProcessingParameterField(self.COLAME, 
-                                                      self.tr("Colonne direction"),
+                                                      self.tr("Colonne(s) aménagements"),
                                                       parentLayerParameterName=self.RESEAU,
                                                       optional= False,
                                                       allowMultiple = True))
         
         self.addParameter(
-            QgsProcessingParameterFeatureSink(
+            QgsProcessingParameterRasterDestination(
                 self.OUTPUT,
-                self.tr('Output layer')
+                self.tr('Output raster')
             )
         )
     def processAlgorithm(self, parameters, context, feedback):
@@ -141,8 +146,16 @@ class AnalyseExistant(QgsProcessingAlgorithm):
         
         
         # 1.Extraire les routes avec aménagements
-        expr = f'"{col_ame}" IS NOT NULL'
-        request = QgsFeatureRequest().setFilterExpression(expr)
+        if len(col_ame)>1:
+            conditions = []
+            for col in col_ame:
+                conditions.append(f'"{col}" IS NOT NULL')
+            expr = " AND ".join(conditions)  # ou " OR " selon ce que vous voulez
+            request = QgsFeatureRequest().setFilterExpression(expr)
+        else:
+            expr = f'"{col} IS NOT NULL'
+            request = QgsFeatureRequest().setFilterExpression(expr)
+
         
         velo = reseau.materialize(request)
         
@@ -224,15 +237,52 @@ class AnalyseExistant(QgsProcessingAlgorithm):
         
         
         
-        feat = next(chainons_manquants.getFeatures(QgsFeatureRequest().setFilterFid(1)))
-        fields = feat.fields()
-        (sink_traffic, dest_id) = self.parameterAsSink(
-        parameters, self.OUTPUT, context,
-        fields, QgsWkbTypes.LineString, reseau.crs()
-        )
+        new_layer = chainons_manquants.materialize(QgsFeatureRequest().setFilterFids(chainons_manquants.allFeatureIds()))
+        fields = new_layer.fields()
         
-        for feat in chainons_manquants.getFeatures():
-            sink_traffic.addFeature(feat, QgsFeatureSink.FastInsert)
+        
+        
+            
+        raster = processing.run("gdal:rasterize", 
+                   {'INPUT': new_layer,
+                    'FIELD':'score_services',
+                    'BURN':0,
+                    'USE_Z':False,
+                    'UNITS':1,
+                    'WIDTH':10,'HEIGHT':10,
+                    'EXTENT':None,'NODATA':0,
+                    'CREATION_OPTIONS':None,
+                    'DATA_TYPE':5,'INIT':None,
+                    'INVERT':False,'EXTRA':'',
+                    'OUTPUT': QgsProcessingUtils.generateTempFilename(
+                        'score_services_rasterized.tif', context)}
+                   )['OUTPUT']
+        
+        ds = gdal.Open(raster) if isinstance(raster, str) else raster
+        arr = ds.GetRasterBand(1).ReadAsArray().astype(float)
+        r_min = float(np.nanmin(arr))
+        r_max = float(np.nanmax(arr))
+        feedback.pushInfo(f"score_services min={r_min}, max={r_max}")
+        if r_max == r_min:
+            feedback.pushWarning("Toutes les valeurs sont identiques, la normalisation est ignorée.")
+            formula = "A*0"  # ou une autre valeur par défaut
+        else:
+            formula = f"((A - {r_min}) / ({r_max} - {r_min})) * 100"
 
-        return {self.OUTPUT: dest_id}
+        calcul = processing.run("gdal:rastercalculator", 
+                       {'INPUT_A':raster,
+                        'BAND_A':1,
+                        'INPUT_B':None,'BAND_B':None,
+                        'INPUT_C':None,'BAND_C':None,
+                        'INPUT_D':None,'BAND_D':None,
+                        'INPUT_E':None,'BAND_E':None,
+                        'INPUT_F':None,'BAND_F':None,
+                        'FORMULA':formula,
+                        'NO_DATA':None,
+                        'EXTENT_OPT':0,'PROJWIN':None,
+                        'RTYPE':5,'CREATION_OPTIONS':None,
+                        'EXTRA':'',
+                        'OUTPUT':parameters[self.OUTPUT]})
+
+        return {self.OUTPUT: calcul['OUTPUT']}
     

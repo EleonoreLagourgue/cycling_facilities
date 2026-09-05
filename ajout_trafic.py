@@ -40,6 +40,7 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingParameterString,
                        QgsProcessingParameterEnum, 
                        QgsProcessingParameterNumber,
+                       QgsFeatureRequest,
                        QgsField,
                        QgsFeature)
 
@@ -179,11 +180,12 @@ class AjoutTrafic(QgsProcessingAlgorithm):
         field_nom = self.parameterAsString(parameters, self.DIRECTION_FIELD, context)
         field_pl = self.parameterAsString(parameters, self.TRAFIC_PL, context)
 
-
         
+        new_layer = source.materialize(QgsFeatureRequest().setFilterFids(source.allFeatureIds()))
         
-        pr = source.dataProvider()
-        existing = set(source.fields().names())
+        #Vérification
+        pr = new_layer.dataProvider()
+        existing = set(new_layer.fields().names())
         to_add =[]
         if 'pos_key' not in existing:
             to_add = [           
@@ -193,27 +195,28 @@ class AjoutTrafic(QgsProcessingAlgorithm):
         #to_add = [QgsField('pos_key', QVariant.String) if 'pos_key' not in existing]
         if to_add:
             pr.addAttributes(to_add)
-            source.updateFields()
+            new_layer.updateFields()
             feedback.pushInfo(f"Added:, {[f.name() for f in to_add]}")
         else:
             feedback.pushInfo("Rien à ajouter")
         
-        print(source.fields().names())
-        idx_key = source.fields().indexOf('pos_key')
-    
-        source.startEditing()
+        print(new_layer.fields().names())
+        idx_key = new_layer.fields().indexOf('pos_key')
+        
+        features = list(new_layer.getFeatures())
+        new_layer.startEditing()
 
         precision=6
         groups = {}
-        for feat in source.getFeatures():
+        for feat in features:
             geom = feat.geometry()
             pt = geom.asPoint()  
             key = f"{round(pt.x(), precision)}_{round(pt.y(), precision)}"
-            source.changeAttributeValue(feat.id(), idx_key, key)
+            new_layer.changeAttributeValue(feat.id(), idx_key, key)
             groups.setdefault(key, []).append(feat)
         
             
-        source.commitChanges()
+        new_layer.commitChanges()
         
         aggregates = [
             {
@@ -242,7 +245,7 @@ class AjoutTrafic(QgsProcessingAlgorithm):
                 'type_name': 'double'
             })
         cpt_aggre = processing.run("native:aggregate", 
-                       {'INPUT': source,
+                       {'INPUT': new_layer,
                         'GROUP_BY':'geom_to_wkb($geometry)',
                         'AGGREGATES':aggregates,
                         'OUTPUT':'memory:compteurs_moyennes'
@@ -326,5 +329,5 @@ class AjoutTrafic(QgsProcessingAlgorithm):
         # statistics, etc. These should all be included in the returned
         # dictionary, with keys matching the feature corresponding parameter
         # or output names.
-        return {}
+        return {self.OUTPUT: dest_id}
 
