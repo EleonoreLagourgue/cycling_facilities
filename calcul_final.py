@@ -207,7 +207,7 @@ class AMC(QgsProcessingAlgorithm):
         
         
             
-        result = processing.run("gdal:rastercalculatorc", 
+        result = processing.run("gdal:rastercalculator", 
                            {"INPUT_A": offre, "BAND_A": 1,
                             "INPUT_B": demande, "BAND_B": 1,
                             "INPUT_C": reseau, "BAND_C": 1,

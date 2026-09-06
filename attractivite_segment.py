@@ -39,12 +39,14 @@ from qgis.PyQt.QtCore import QCoreApplication, QVariant
 
 from qgis.core import (
     QgsProcessing,
+    QgsProcessingException,
     QgsProcessingAlgorithm,
     QgsProcessingParameterVectorLayer,
     QgsProcessingParameterRasterLayer,
     QgsProcessingParameterNumber,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterRasterDestination,
+    QgsProcessingParameterField,
     QgsProcessingUtils,
     QgsFeature,
     QgsGeometry,
@@ -57,7 +59,10 @@ from osgeo import gdal, ogr
 class TripGenerationProcessor(QgsProcessingAlgorithm):
     ROADS = 'ROADS'
     POIS = 'POIS'
-    POPULATION = 'POPULATION'
+    WEIGHT_FIELD = 'WEIGHT_FIELD'
+    RADIUS = 'RADIUS'
+    PIXEL_SIZE = 'PIXEL_SIZE'
+
     OUTPUT = 'OUTPUT'
     def name(self):
         return 'Calcul attractivité aux services'
@@ -106,13 +111,30 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
                 self.POIS, 'Points Générateurs de Trafic (PNT)', [QgsProcessing.TypeVectorPoint]
             )
         )
-        # # Couche de population (carroyage ou polygones)
-        # self.addParameter(
-        #     QgsProcessingParameterVectorLayer(
-        #         self.POPULATION, 'Densité de Population', [QgsProcessing.TypeVectorPolygon]
-        #     )
-        # )
-        # Sink de sortie
+        self.addParameter(
+            QgsProcessingParameterField(
+                self.WEIGHT_FIELD,
+                'Champ de pondération des PNT (ex: gare=3, commerce=1)',
+                parentLayerParameterName=self.POIS,
+                type=QgsProcessingParameterField.Numeric,
+                optional=True,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.RADIUS, "Rayon d'attractivité (unités du CRS des PNT, ex: mètres)",
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=1000,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.PIXEL_SIZE, 'Taille de pixel (unités du CRS des PNT)',
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=10,
+            )
+        )
+
         self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT, "Raster l'attractivité i.e. proximité aux services"
@@ -120,34 +142,49 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
         )
 
     def processAlgorithm(self, parameters, context, feedback):
-        lignes = self.parameterAsVectorLayer(parameters, self.ROADS, context)
+        lignes_source = self.parameterAsVectorLayer(parameters, self.ROADS, context)
         pois = self.parameterAsVectorLayer(parameters, self.POIS, context)
-        pop = self.parameterAsVectorLayer(parameters, self.POPULATION, context)
+        poids = self.parameterAsString(parameters, self.WEIGHT_FIELD, context)
+        radius = self.parameterAsDouble(parameters, self.RADIUS, context)
+        pixel_size = self.parameterAsDouble(parameters, self.PIXEL_SIZE, context)
+        
+        if lignes_source is None or pois is None:
+            raise QgsProcessingException("Couche(s) d'entrée invalide(s).")
+ 
+        if poids and pois.fields().lookupField(poids) == -1:
+            raise QgsProcessingException(
+                f"Le champ de pondération '{poids}' est introuvable dans la couche PNT."
+            )
+        if pois.crs().isGeographic():
+            feedback.pushWarning(
+                "Le CRS de la couche PNT est géographique (degrés). "
+                "Le rayon et la taille de pixel ne correspondent pas à des mètres."
+            )
+        
+        lignes = self._clone_layer(lignes_source, context, feedback)
+
+
 
         #1. Densité de Kernel (KDE) pour la génération de trafic PNT
         feedback.pushInfo("Calcul de la densité des PNT...")
-        kde_result = processing.run("qgis:heatmapkerneldensityestimation", {
+    
+        
+        kde_params = {
             'INPUT': pois,
-            'RADIUS': 1000, # Rayon de 1 km d'attractivité
-            'PIXEL_SIZE': 10,
-            'WEIGHT_FIELD': 'poids', # Poids selon le type de POI (ex: gare=3, commerce=1)
-            'OUTPUT': QgsProcessingUtils.generateTempFilename('kde_pois.tif')
-        }, context=context, feedback=feedback)
+            'RADIUS': radius,
+            'PIXEL_SIZE': pixel_size,
+            'OUTPUT': QgsProcessingUtils.generateTempFilename('kde_pois.tif'),
+        }
+        if poids:
+            kde_params['WEIGHT_FIELD'] = poids
+        kde_result = processing.run(
+            "qgis:heatmapkerneldensityestimation", kde_params,
+            context=context, feedback=feedback
+        )
+
 
         #2. Statistiques de zone sur les segments routiers (Attribution du score PNT)
-        feedback.pushInfo("Attribution des scores d'attractivité aux tronçons...")
-        
-        
-        
-        # roads_with_pois = processing.run("native:zonalstatisticsfb", {
-        #     'INPUT_RASTER': kde_result['OUTPUT'],
-        #     'RASTER_BAND': 1,
-        #     'INPUT': lignes,
-        #     'COLUMN_PREFIX': 'score_accidents',
-        #     'STATISTICS': [2], # Moyenne (Mean)
-        #     'OUTPUT': 'memory:'
-        # }, context=context, feedback=feedback)['OUTPUT']
-        
+        feedback.pushInfo("Attribution des scores d'attractivité aux tronçons...")  
         
         kde_raster_path = kde_result['OUTPUT']
         src_ds = gdal.Open(kde_raster_path)
@@ -157,7 +194,21 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
         rows = src_ds.RasterYSize
         band = src_ds.GetRasterBand(1)
         nodata = band.GetNoDataValue()
-        src_array = band.ReadAsArray().astype(float)
+        
+        px_w = gt[1]
+        px_h = gt[5]
+        
+        need_reproject = lignes.crs() != pois.crs()
+        if need_reproject:
+            feedback.pushWarning(
+                "Le CRS du réseau routier diffère de celui des PNT : "
+                "reprojection à la volée des géométries pour le calcul des scores."
+            )
+        transform = None
+        if need_reproject:
+            from qgis.core import QgsCoordinateTransform, QgsProject
+            transform = QgsCoordinateTransform(lignes.crs(), pois.crs(), QgsProject.instance())
+
         
         total = lignes.featureCount()
         mem_drv = gdal.GetDriverByName('MEM')
@@ -171,55 +222,105 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
                 QgsField("score_services", QVariant.Double)])
         lignes.updateFields()
         idx = lignes.fields().lookupField('score_services')
+        mem_ogr_drv = ogr.GetDriverByName('Memory')
+ 
+
         for current, feature in enumerate(lignes.getFeatures()):
+            if feedback.isCanceled():
+                break
+ 
             geom = feature.geometry()
-            
-            mem_ogr_drv = ogr.GetDriverByName('Memory')
+            if transform is not None:
+                geom = QgsGeometry(geom)
+                geom.transform(transform)
+ 
+            bbox = geom.boundingBox()
+            if bbox.isEmpty():
+                pr.changeAttributeValues({feature.id(): {idx: 0.0}})
+                continue
+ 
+            # Fenêtre pixel correspondant à la bbox du tronçon (+1 pixel de
+            # marge) au lieu de recalculer un masque sur tout le raster.
+            col_min = max(0, int((bbox.xMinimum() - gt[0]) / px_w) - 1)
+            col_max = min(cols, int((bbox.xMaximum() - gt[0]) / px_w) + 2)
+            row_min = max(0, int((bbox.yMaximum() - gt[3]) / px_h) - 1)
+            row_max = min(rows, int((bbox.yMinimum() - gt[3]) / px_h) + 2)
+ 
+            win_cols = col_max - col_min
+            win_rows = row_max - row_min
+            if win_cols <= 0 or win_rows <= 0:
+                pr.changeAttributeValues({feature.id(): {idx: 0.0}})
+                continue
+ 
+            sub_gt = (
+                gt[0] + col_min * px_w, px_w, 0,
+                gt[3] + row_min * px_h, 0, px_h,
+            )
+ 
             mem_ogr_ds = mem_ogr_drv.CreateDataSource('mem')
             mem_ogr_layer = mem_ogr_ds.CreateLayer('line', geom_type=ogr.wkbLineString)
             ogr_feat = ogr.Feature(mem_ogr_layer.GetLayerDefn())
             ogr_feat.SetGeometry(ogr.CreateGeometryFromWkt(geom.asWkt()))
             mem_ogr_layer.CreateFeature(ogr_feat)
-
-            # Masque raster en mémoire, mêmes dimensions que le KDE
-            mask_ds = mem_drv.Create('', cols, rows, 1, gdal.GDT_Byte)
-            mask_ds.SetGeoTransform(gt)
+ 
+            mask_ds = mem_drv.Create('', win_cols, win_rows, 1, gdal.GDT_Byte)
+            mask_ds.SetGeoTransform(sub_gt)
             mask_ds.SetProjection(proj)
-
             gdal.RasterizeLayer(
                 mask_ds, [1], mem_ogr_layer,
                 burn_values=[1],
-                options=['ALL_TOUCHED=TRUE']
-            )# On rasterise tous les pixels qui touche la géométrie pour faire un masque
+                options=['ALL_TOUCHED=TRUE'],
+            )
             mask_array = mask_ds.GetRasterBand(1).ReadAsArray()
-
-            pixels_values = src_array[mask_array == 1]
+            src_window = band.ReadAsArray(col_min, row_min, win_cols, win_rows).astype(float)
+ 
+            pixels_values = src_window[mask_array == 1]
             if nodata is not None:
                 pixels_values = pixels_values[pixels_values != nodata]
-
+ 
             score = float(pixels_values.mean()) if pixels_values.size > 0 else 0.0
-
-            
-            pr.changeAttributeValues({feature.id():{idx: score}})
-            
-
-
-            feedback.setProgress(int(current / total * 100))
+            pr.changeAttributeValues({feature.id(): {idx: score}})
+ 
+            # Libération explicite des objets GDAL/OGR temporaires
+            mask_ds = None
+            mem_ogr_ds = None
+ 
+            if total > 0:
+                feedback.setProgress(int(current / total * 100))
+ 
         lignes.commitChanges()
+
+        
+
 
         raster = processing.run("gdal:rasterize", 
                    {'INPUT': lignes,
                     'FIELD':'score_services',
-                    'BURN':0,
+                    'BURN':None,
                     'USE_Z':False,
                     'UNITS':1,
                     'WIDTH':10,'HEIGHT':10,
-                    'EXTENT':None,'NODATA':0,
+                    'EXTENT':None,'NODATA':-9999,
                     'CREATION_OPTIONS':None,
                     'DATA_TYPE':5,'INIT':None,
                     'INVERT':False,'EXTRA':'',
                     'OUTPUT':QgsProcessingUtils.generateTempFilename(
                         'raster.tif', context)})['OUTPUT']
+        
+        stats_ds = gdal.Open(raster)
+        stats_band = stats_ds.GetRasterBand(1)
+        stats = stats_band.GetStatistics(0, 1)  # [min, max, mean, stddev]
+        vmin, vmax = stats[0], stats[1]
+        stats_ds = None
+     
+        if vmax == vmin:
+            feedback.pushWarning(
+                "Tous les tronçons ont le même score : la normalisation 0-100 "
+                "est ignorée (raster de sortie mis à 0)."
+            )
+            formula = '(A*0)'
+        else:
+            formula = f'((A - {vmin}) / ({vmax} - {vmin}))*100'
         result = processing.run("gdal:rastercalculator", 
                        {'INPUT_A':raster,
                         'BAND_A':1,
@@ -228,7 +329,7 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
                         'INPUT_D':None,'BAND_D':None,
                         'INPUT_E':None,'BAND_E':None,
                         'INPUT_F':None,'BAND_F':None,
-                        'FORMULA':'((A - A.min()) / (A.max() - A.min()))*100',
+                        'FORMULA': formula,
                         'NO_DATA':None,
                         'EXTENT_OPT':0,'PROJWIN':None,
                         'RTYPE':5,'CREATION_OPTIONS':None,
@@ -236,5 +337,21 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
                         'OUTPUT':parameters[self.OUTPUT]})
 
         return {self.OUTPUT: result['OUTPUT']}
+    def _clone_layer(self, layer, context, feedback):
+        """Retourne une copie mémoire de la couche pour ne jamais modifier
+        l'entrée fournie par l'utilisateur (reprojection vers son propre
+        CRS = simple moyen d'obtenir une copie mémoire indépendante via
+        les algos natifs de QGIS)."""
+        clone = processing.run(
+            "native:reprojectlayer",
+            {
+                'INPUT': layer,
+                'TARGET_CRS': layer.crs(),
+                'OUTPUT': 'memory:',
+            },
+            context=context, feedback=feedback
+        )['OUTPUT']
+        return clone
+
 
     

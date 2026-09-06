@@ -64,6 +64,115 @@ from scipy.spatial import cKDTree
 import pandas as pd
 import numpy as np
 
+from qgis.core import QgsApplication
+
+def resolve_grass_alg(short_name):
+    """
+    Trouve l'ID complet d'un algorithme GRASS quel que soit
+    le préfixe (grass:, grass7:, grass8:) utilisé par la
+    version de QGIS/GRASS installée.
+    """
+    registry = QgsApplication.processingRegistry()
+    for alg in registry.algorithms():
+        if alg.id().endswith(short_name):
+            return alg.id()
+    return None
+
+def build_expr(columns, is_not_null=True):
+    
+    if is_not_null:
+        op = "IS NOT NULL" 
+        conditions = [f'"{col}" {op}' for col in columns]
+        return " OR ".join(conditions)
+    else:
+        op = "IS NULL" 
+        conditions = [f'"{col}" {op}' for col in columns]
+        return " AND ".join(conditions)
+
+
+# Profils par source : pour chaque source de données connue, on associe à
+# chaque nom de colonne la liste des valeurs qui indiquent réellement un
+# aménagement cyclable. Une colonne non listée dans le profil retombe sur
+# IS NOT NULL (en excluant les valeurs "vides de sens" ci-dessous).
+#
+# Pour ajouter une nouvelle source : ajoute une entrée ici avec les noms de
+# colonnes et valeurs réels de ton jeu de données (à vérifier dans la table
+# attributaire QGIS ou la documentation du fournisseur).
+SOURCE_PROFILES = {
+    'OSM': {
+        'highway': ['cycleway'],
+        'cycleway': ['track', 'lane', 'shared_lane', 'opposite',
+                     'opposite_lane', 'opposite_track'],
+        'cycleway:left': ['track', 'lane', 'shared_lane', 'opposite_track'],
+        'cycleway:right': ['track', 'lane', 'shared_lane', 'opposite_track'],
+        'cycleway:both': ['track', 'lane', 'shared_lane'],
+        'bicycle': ['designated'],
+        'bicycle_road': ['yes'],
+    },
+    'IGN BD TOPO': {
+        # Classe "Tronçon de route" : la piste cyclable en site propre est
+        # une Nature à part entière ; les aménagements sur voirie partagée
+        # (bande, voie verte, vélorue...) sont dans "Nature de la restriction".
+        # Les noms de champs shapefile peuvent être tronqués (10 caractères) :
+        # adapte 'nature' / 'nature_de_la_restriction' au nom réel dans ta couche.
+        'nature': ['Piste cyclable'],
+        'nature_de_la_restriction': [
+            'Piste cyclable', 'Voie verte', 'Vélorue',
+            'Chaussée à voie centrale banalisée',
+            'Aménagement mixte hors voie verte',
+            'Double sens cyclable non matérialisé',
+        ],
+    },
+}
+
+# Valeurs qui, même non nulles, signifient explicitement "pas d'aménagement",
+# utilisées en repli pour une colonne sans profil connu, ou en mode Personnalisé.
+NO_FACILITY_VALUES = ['no', 'none', 'Aucun', 'Non', 'Sans objet', 'Sans valeur']
+
+def build_cycling_expr(columns, profile=None, custom_values=None, presence=True):
+    """
+    Construit une expression QGIS qui sélectionne (presence=True) ou exclut
+    (presence=False) les segments avec un aménagement cyclable.
+
+    - profile : dict {colonne: [valeurs valides]} issu de SOURCE_PROFILES,
+      ou None si on utilise custom_values.
+    - custom_values : liste de valeurs (mode "Personnalisé") appliquée telle
+      quelle à TOUTES les colonnes sélectionnées, utile pour une source non
+      répertoriée dans SOURCE_PROFILES.
+    """
+    profile = profile or {}
+    conditions = []
+    for col in columns:
+        valid_values = profile.get(col) or custom_values
+        if valid_values:
+            values_str = ", ".join(f"'{v}'" for v in valid_values)
+            if presence:
+                cond = f'"{col}" IN ({values_str})'
+            else:
+                # NULL-safe : un champ NULL ne peut pas satisfaire "IN (...)",
+                # donc il ne peut pas non plus satisfaire "NOT IN (...)" en
+                # logique à trois valeurs (NULL, pas TRUE). On le traite
+                # explicitement comme une absence d'aménagement.
+                cond = f'("{col}" IS NULL OR "{col}" NOT IN ({values_str}))'
+        else:
+            # Ni profil ni valeurs personnalisées pour cette colonne :
+            # on retombe sur "non nul et différent des valeurs 'vides'"
+            no_values_str = ", ".join(f"'{v}'" for v in NO_FACILITY_VALUES)
+            if presence:
+                cond = f'"{col}" IS NOT NULL AND "{col}" NOT IN ({no_values_str})'
+            else:
+                cond = f'("{col}" IS NULL OR "{col}" IN ({no_values_str}))'
+        conditions.append(cond)
+
+    # On construit l'expression
+    # voulue pour chaque mode :
+    # - présence = au moins une colonne indique un aménagement (OR)
+    # - absence  = aucune colonne n'indique un aménagement (AND)
+    if presence:
+        return " OR ".join(conditions)
+    return " AND ".join(conditions)
+
+    
 class AnalyseExistant(QgsProcessingAlgorithm):
     """
     Algorithme pour trouver où sont les aménagements cyclables déjà en place
@@ -71,9 +180,14 @@ class AnalyseExistant(QgsProcessingAlgorithm):
     """
     RESEAU = 'RESEAU'
     COLAME = 'COLAME'
+    SOURCE = 'SOURCE'
+    VALEURS_PERSONNALISEES = 'VALEURS_PERSONNALISEES'
     
     
     OUTPUT = 'OUTPUT'
+
+    # Ordre des options affichées dans le menu déroulant SOURCE
+    SOURCE_OPTIONS = list(SOURCE_PROFILES.keys()) + ['Personnalisé']
     def name(self):
         """
         Returns the algorithm name, used for identifying the algorithm. This
@@ -129,6 +243,26 @@ class AnalyseExistant(QgsProcessingAlgorithm):
                                                       parentLayerParameterName=self.RESEAU,
                                                       optional= False,
                                                       allowMultiple = True))
+
+        self.addParameter(
+            QgsProcessingParameterEnum(
+                self.SOURCE,
+                self.tr("Source des données (détermine les valeurs valides par colonne)"),
+                options=self.SOURCE_OPTIONS,
+                defaultValue=0
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterString(
+                self.VALEURS_PERSONNALISEES,
+                self.tr(
+                    "Valeurs indiquant un aménagement (mode Personnalisé uniquement, "
+                    "séparées par des virgules, ex: Piste cyclable,Bande cyclable)"
+                ),
+                optional=True
+            )
+        )
         
         self.addParameter(
             QgsProcessingParameterRasterDestination(
@@ -143,26 +277,41 @@ class AnalyseExistant(QgsProcessingAlgorithm):
         reseau = self.parameterAsSource(parameters, self.RESEAU, context)
         col_ame = self.parameterAsStrings(parameters, self.COLAME, context)
 
-        
-        
-        # 1.Extraire les routes avec aménagements
-        if len(col_ame)>1:
-            conditions = []
-            for col in col_ame:
-                conditions.append(f'"{col}" IS NOT NULL')
-            expr = " AND ".join(conditions)  # ou " OR " selon ce que vous voulez
-            request = QgsFeatureRequest().setFilterExpression(expr)
-        else:
-            expr = f'"{col} IS NOT NULL'
-            request = QgsFeatureRequest().setFilterExpression(expr)
+        source_idx = self.parameterAsEnum(parameters, self.SOURCE, context)
+        source_name = self.SOURCE_OPTIONS[source_idx]
+        valeurs_perso_str = self.parameterAsString(parameters, self.VALEURS_PERSONNALISEES, context)
 
-        
+        if source_name == 'Personnalisé':
+            profile = None
+            custom_values = [v.strip() for v in valeurs_perso_str.split(',') if v.strip()] or None
+            if not custom_values:
+                feedback.pushWarning(
+                    "Mode Personnalisé sans valeurs renseignées : repli sur "
+                    "IS NOT NULL (hors valeurs 'vides' usuelles) pour toutes les colonnes."
+                )
+        else:
+            profile = SOURCE_PROFILES.get(source_name, {})
+            custom_values = None
+
+        feedback.pushInfo(f"Colonnes sélectionnées : {col_ame} (source : {source_name})")
+        # 1.Extraire les routes avec aménagements
+        expr = build_cycling_expr(col_ame, profile=profile, custom_values=custom_values, presence=True)
+        feedback.pushInfo(f"Expression aménagements : {expr}")
+        request = QgsFeatureRequest().setFilterExpression(expr)
         velo = reseau.materialize(request)
-        
+        print("Nb entités:", velo.featureCount())
+
         # 2.Trouver les trous
         # a.Calculer les composantes connexes
+        alg_id = resolve_grass_alg("v.net.components")
+        if alg_id is None:
+            raise RuntimeError(
+                "L'algorithme GRASS v.net.components est introuvable. "
+                "Vérifiez que le fournisseur GRASS est activé dans "
+                "Traitement > Options > Fournisseurs."
+            )
         result_pts = processing.run(
-            "grass:v.net.components", 
+            alg_id, 
             {'input':velo,
              'points':None,
              'threshold':50,
@@ -176,18 +325,22 @@ class AnalyseExistant(QgsProcessingAlgorithm):
              'GRASS_SNAP_TOLERANCE_PARAMETER':-1,
              'GRASS_MIN_AREA_PARAMETER':0.0001,
              'GRASS_OUTPUT_TYPE_PARAMETER':0,'GRASS_VECTOR_DSCO':'',
-             'GRASS_VECTOR_LCO':'','GRASS_VECTOR_EXPORT_NOCAT':False})
+             'GRASS_VECTOR_LCO':'','GRASS_VECTOR_EXPORT_NOCAT':False}
+            , context=context, feedback=feedback)
         
         velo_lines = result_pts['output']
-        velo_nodes = result_pts['output_point']
+        #velo_nodes = result_pts['output_point']
         
         # b.Trouver les routes connectant différentes composantes connexes
         
         
-        expr_sans = f'"{col_ame}" IS NULL'
+        expr_sans = build_cycling_expr(col_ame, profile=profile, custom_values=custom_values, presence=False)
+        feedback.pushInfo(f"Expression sans aménagement : {expr_sans}")
         request_sans = QgsFeatureRequest().setFilterExpression(expr_sans)
         sans_ame = reseau.materialize(request_sans)
-        
+        feedback.pushInfo(f"Segments sans aménagement : {sans_ame.featureCount()}")
+        print("Nb entités sans aménagements:", sans_ame.featureCount())
+
         # On crée un 'id' car l'algo extraxtspecificvertices efface les fid
         sans_ame_id = sans_ame.materialize(QgsFeatureRequest())  # copie
         sans_ame_id.startEditing()
@@ -198,12 +351,14 @@ class AnalyseExistant(QgsProcessingAlgorithm):
             sans_ame_id.changeAttributeValue(f.id(), idx, f.id())
         sans_ame_id.commitChanges()
         
+        print("Nb entités sans aménagements:", sans_ame_id.featureCount())
+
         extremites = processing.run(
         "native:extractspecificvertices",
         {'INPUT': sans_ame_id,
          'VERTICES': '0,-1',
          'OUTPUT': 'memory:'})['OUTPUT']
-        
+        print("Nb entités extrémités:", extremites.featureCount())
         #Jointure
         join = processing.run(
         "native:joinbynearest",
@@ -213,17 +368,59 @@ class AnalyseExistant(QgsProcessingAlgorithm):
          'DISCARD_NONMATCHING': False,
          'PREFIX': 'velo_',
          'NEIGHBORS': 1,
-         'MAX_DISTANCE': 50,
-         'OUTPUT': 'memory:'})['OUTPUT']
+         'MAX_DISTANCE': 70,
+         'OUTPUT': 'memory:'}
+        , context=context, feedback=feedback)['OUTPUT']
         #Plutôt qu'une jointure peut être trouver là où touche les bouts
         
         clusters_par_segment = defaultdict(dict)  # {feature_id: {vertex_index: cluster}}
+        idx = join.fields().indexOf('velo_comp')
+        print(f"Index des compo : {idx}")
         
+        idx = join.fields().indexOf('vertex_index')
+        print(f"Index des vertex : {idx}")
+
         for f in join.getFeatures():
             fid_origine = f['seg_id']   
             vidx = f['vertex_index']
             cluster = f['velo_comp']
             clusters_par_segment[fid_origine][vidx] = cluster
+        print(len(clusters_par_segment))
+        
+        nb_deux_extremites = sum(
+            1 for d in clusters_par_segment.values()
+            if d.get(0) is not None and d.get(-1) is not None
+        )
+        nb_une_seule = sum(
+            1 for d in clusters_par_segment.values()
+            if (d.get(0) is None) != (d.get(-1) is None)
+        )
+        nb_meme_comp = sum(
+            1 for d in clusters_par_segment.values()
+            if d.get(0) is not None and d.get(-1) is not None and d.get(0) == d.get(-1)
+        )
+        feedback.pushInfo(
+            f"Tronçons avec les 2 extrémités jointes à un aménagement : {nb_deux_extremites}\n"
+            f"Tronçons avec une seule extrémité jointe (l'autre trop loin ou hors seuil) : {nb_une_seule}\n"
+            f"Tronçons dont les 2 extrémités tombent dans la MÊME composante : {nb_meme_comp}"
+        )
+        if nb_deux_extremites == 0:
+            feedback.pushWarning(
+                "Aucun tronçon n'a ses 2 extrémités à moins de MAX_DISTANCE "
+                "d'un aménagement existant : le seuil est probablement trop "
+                "petit (ou dans la mauvaise unité, cf. avertissement CRS "
+                "plus haut) par rapport aux trous réels du réseau."
+            )
+        elif nb_deux_extremites == nb_meme_comp:
+            feedback.pushWarning(
+                "Toutes les extrémités jointes tombent dans la même "
+                "composante connexe : soit le réseau cyclable n'a en réalité "
+                "qu'une seule composante (vérifiez comp_values ci-dessus), "
+                "soit les vrais chaînons manquants nécessitent plusieurs "
+                "tronçons consécutifs (pas un seul segment direct) et ne "
+                "peuvent donc pas être détectés par cette méthode."
+            )
+
 
         candidats_ids = []
         for fid, d in clusters_par_segment.items():
@@ -231,21 +428,42 @@ class AnalyseExistant(QgsProcessingAlgorithm):
             c1 = d.get(-1)
             if c0 is not None and c1 is not None and c0 != c1:
                 candidats_ids.append(fid)
+        print(len(candidats_ids))
         expr_candidats = f'"seg_id" IN ({",".join(map(str, candidats_ids))})'  # adapter le nom du champ ID
         request_candidats = QgsFeatureRequest().setFilterExpression(expr_candidats)
-        chainons_manquants = sans_ame.materialize(request_candidats)
+        chainons_manquants = sans_ame_id.materialize(request_candidats)
         
         
         
-        new_layer = chainons_manquants.materialize(QgsFeatureRequest().setFilterFids(chainons_manquants.allFeatureIds()))
-        fields = new_layer.fields()
+        #new_layer = chainons_manquants.materialize(QgsFeatureRequest().setFilterFids(chainons_manquants.allFeatureIds()))
+        print("Nb entités:", chainons_manquants.featureCount())
         
         
-        
+        if chainons_manquants.featureCount() == 0:
+            print("Pas de features !")
+            feedback.pushWarning(
+                "Aucun chaînon manquant détecté : génération d'un raster "
+                "vide (valeur 0 partout) sur l'emprise du réseau "
+            )
             
-        raster = processing.run("gdal:rasterize", 
-                   {'INPUT': new_layer,
-                    'FIELD':'score_services',
+            raster = processing.run("gdal:rasterize", 
+                       {'INPUT': reseau,
+                        'FIELD':'',
+                        'BURN':0,
+                        'USE_Z':False,
+                        'UNITS':1,
+                        'WIDTH':10,'HEIGHT':10,
+                        'EXTENT':None,'NODATA':0,
+                        'CREATION_OPTIONS':None,
+                        'DATA_TYPE':5,'INIT':None,
+                        'INVERT':False,'EXTRA':'',
+                        'OUTPUT': QgsProcessingUtils.generateTempFilename(
+                            'score_services_rasterized.tif', context)}
+                       , context=context, feedback=feedback)['OUTPUT']
+        else:
+            raster = processing.run("gdal:rasterize", 
+                   {'INPUT': chainons_manquants,
+                    'FIELD':'',
                     'BURN':0,
                     'USE_Z':False,
                     'UNITS':1,
@@ -256,9 +474,15 @@ class AnalyseExistant(QgsProcessingAlgorithm):
                     'INVERT':False,'EXTRA':'',
                     'OUTPUT': QgsProcessingUtils.generateTempFilename(
                         'score_services_rasterized.tif', context)}
-                   )['OUTPUT']
+                   , context=context, feedback=feedback)['OUTPUT']
+        print("Chemin raster:", repr(raster))
+        import os
+        print("Existe:", os.path.exists(raster))
         
         ds = gdal.Open(raster) if isinstance(raster, str) else raster
+        if ds is None:
+            raise RuntimeError(f"Impossible d'ouvrir le raster généré : {raster}")
+
         arr = ds.GetRasterBand(1).ReadAsArray().astype(float)
         r_min = float(np.nanmin(arr))
         r_max = float(np.nanmax(arr))
@@ -282,7 +506,8 @@ class AnalyseExistant(QgsProcessingAlgorithm):
                         'EXTENT_OPT':0,'PROJWIN':None,
                         'RTYPE':5,'CREATION_OPTIONS':None,
                         'EXTRA':'',
-                        'OUTPUT':parameters[self.OUTPUT]})
+                        'OUTPUT':parameters[self.OUTPUT]}
+                       , context=context, feedback=feedback)
 
         return {self.OUTPUT: calcul['OUTPUT']}
     

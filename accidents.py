@@ -54,12 +54,6 @@ import numpy as np
 import os
 
 
-_TMP_DIR = r'C:\Users\eleonore.lagourgue\qgis_tmp'
-if os.name == 'nt':
-    os.makedirs(_TMP_DIR, exist_ok=True)
-    os.environ['TMP'] = _TMP_DIR
-    os.environ['TEMP'] = _TMP_DIR
-
 
 class RasteriserAccidents(QgsProcessingAlgorithm):
     ROADS = 'ROADS'
@@ -186,7 +180,7 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
         
 
         updates = {f.id(): {idx: (scores.get(f['join_fid']) if scores.get(f['join_fid']) is not None else 0.0)}
-            for f in lignes.getFeatur}
+            for f in lignes.getFeatures()}
         pr.changeAttributeValues(updates)  # une seule écriture groupée au lieu d'une par entité
         lignes.commitChanges()
        

@@ -39,10 +39,12 @@ from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (QgsProcessing,
                        QgsFeatureRequest,
                        QgsFeatureSink,
+                       QgsProcessingUtils,
                        QgsProcessingAlgorithm,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
                        QgsProcessingParameterRasterDestination,
+                       QgsProcessingException,
                        QgsProcessingParameterField,
                        QgsProcessingParameterString,
                        QgsProcessingParameterEnum, 
@@ -51,6 +53,7 @@ from qgis.core import (QgsProcessing,
                        QgsFeature,
                        QgsWkbTypes,
                        QgsGeometry,
+                       QgsVectorLayer,
                        QgsFields,
                        QgsField,
                        QgsDistanceArea)
@@ -65,10 +68,13 @@ from qgis.analysis import (
 )
 
 from qgis import processing
+from osgeo import gdal
+
 
 from collections import OrderedDict, defaultdict
 from scipy.spatial import cKDTree
 import pandas as pd
+import numpy as np
 
 class RasterisationPop(QgsProcessingAlgorithm):
     """
@@ -150,23 +156,84 @@ class RasterisationPop(QgsProcessingAlgorithm):
         col = self.parameterAsString(parameters, self.COLAME, context)
         output_path = self.parameterAsOutputLayer(parameters, self.OUTPUT, context) #string
         
-        inp.addAttribute(QgsField('densité', QVariant.Int))
-        feedback.pushInfo(col)
         
-        inp.startEditing()
+
         
+        d = QgsDistanceArea()
+        d.setSourceCrs(inp.crs(), context.transformContext())
+        d.setEllipsoid(context.project().ellipsoid() if context.project() else 'WGS84')
+        
+        FIELD_DENS = 'densite'
+
+        idx = inp.fields().indexFromName(col)
+        if idx == -1:
+            raise QgsProcessingException(f"Le champ '{col}' est introuvable dans la couche")
+
+
+        fields = QgsFields(inp.fields())
+        fields.append(QgsField(FIELD_DENS, QVariant.Double))
+
+        geom_type_str = QgsWkbTypes.displayString(inp.wkbType())
+        mem_layer = QgsVectorLayer(
+            f"{geom_type_str}?crs={inp.crs().authid()}",
+            "pop_densite",
+            "memory"
+        )
+        mem_provider = mem_layer.dataProvider()
+        mem_provider.addAttributes(fields)
+        mem_layer.updateFields()
+
+        idx_dens = mem_layer.fields().indexFromName(FIELD_DENS)
+
+
+        min_dens, max_dens = None, None
+
+        new_features = []
+
         for f in inp.getFeatures():
-            idx_dens = f.fieldNameIndex('densité')
-            idx = f.fieldNameIndex(col)
             pop = f[idx]
-            d = QgsDistanceArea()
-            area = d.measurePolygon(f.geometry().asPolygon()[0])
-            f[idx_dens] = pop/area
-            inp.updateFeature( f )
+            geom = f.geometry()
+            area = d.measureArea(geom)
 
-        inp.updateField()
-        inp.commitChanges()
+            if pop is None:
+                feedback.pushWarning(f"Feature {f.id()} : population nulle (None), densité mise à 0")
+                densite = 0.0
+            elif area:
+                # Conversion en habitants/km² : les valeurs en hab/m² sont
+                # trop petites et s'écrasent facilement à 0 en aval
+                densite = (float(pop) / area) * 1_000_000
+            else:
+                feedback.pushWarning(f"Feature {f.id()} : aire nulle, densité mise à 0")
+                densite = 0.0
 
+            new_feat = QgsFeature(fields)
+            new_feat.setGeometry(geom)
+            new_feat.setAttributes(f.attributes() + [densite])
+            new_features.append(new_feat)
+
+            min_dens = densite if min_dens is None else min(min_dens, densite)
+            max_dens = densite if max_dens is None else max(max_dens, densite)
+
+        ok, _ = mem_provider.addFeatures(new_features)
+
+
+        if not ok:
+            raise QgsProcessingException("Échec de l'ajout des features à la couche mémoire")
+        mem_layer.updateExtents()
+        feedback.pushInfo(f"Densité (hab/km²) — min: {min_dens}, max: {max_dens}")
+
+
+        
+        # extent = inp.extent()
+        # extent_str = '{},{},{},{} [{}]'.format(
+        #     extent.xMinimum(),
+        #     extent.xMaximum(),
+        #     extent.yMinimum(),
+        #     extent.yMaximum(),
+        #     inp.crs().authid()
+        # )
+
+        print(mem_layer.featureCount())
         raster = processing.run("gdal:rasterize", 
                        {'INPUT': inp,
                         'FIELD':'densité',
@@ -178,9 +245,28 @@ class RasterisationPop(QgsProcessingAlgorithm):
                         'CREATION_OPTIONS':None,
                         'DATA_TYPE':5,'INIT':None,
                         'INVERT':False,'EXTRA':'',
-                        'OUTPUT':'memory:'})['OUTPUT']
+                        'OUTPUT':QgsProcessingUtils.generateTempFilename(
+                            'score_services_rasterized.tif', context)}, 
+                            context=context, feedback=feedback)['OUTPUT']
         
+        print("Chemin raster:", repr(raster))
+        import os
+        print("Existe:", os.path.exists(raster))
         
+        ds = gdal.Open(raster) if isinstance(raster, str) else raster
+        if ds is None:
+            raise RuntimeError(f"Impossible d'ouvrir le raster généré : {raster}")
+
+        arr = ds.GetRasterBand(1).ReadAsArray().astype(float)
+        r_min = float(np.nanmin(arr))
+        r_max = float(np.nanmax(arr))
+        feedback.pushInfo(f"score_services min={r_min}, max={r_max}")
+        if r_max == r_min:
+            feedback.pushWarning("Toutes les valeurs sont identiques, la normalisation est ignorée.")
+            formula = "A*0"  # ou une autre valeur par défaut
+        else:
+            formula = f"((A - {r_min}) / ({r_max} - {r_min})) * 100"
+            
         result = processing.run("gdal:rastercalculator", 
                        {'INPUT_A':raster,
                         'BAND_A':1,
@@ -189,12 +275,13 @@ class RasterisationPop(QgsProcessingAlgorithm):
                         'INPUT_D':None,'BAND_D':None,
                         'INPUT_E':None,'BAND_E':None,
                         'INPUT_F':None,'BAND_F':None,
-                        'FORMULA':'(A - A.min()) / (A.max() - A.min())',
+                        'FORMULA':formula,
                         'NO_DATA':None,
                         'EXTENT_OPT':0,'PROJWIN':None,
                         'RTYPE':5,'CREATION_OPTIONS':None,
                         'EXTRA':'',
-                        'OUTPUT':'memory:'})
+                        'OUTPUT':parameters[self.OUTPUT]},
+                       context=context, feedback=feedback)
         
         
         
