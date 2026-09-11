@@ -220,7 +220,7 @@ class CateServices(QgsProcessingAlgorithm):
 
             new_feat = QgsFeature(out_fields)
             new_feat.setGeometry(feat.geometry())
-            attrs = feat.attributes()
+            attrs = []
             if matched:
                 attrs += [matched['id'], matched['nom'], matched['poids'], matched['vitesse']]
             else:

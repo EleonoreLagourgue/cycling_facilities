@@ -169,28 +169,22 @@ class RasterisationPop(QgsProcessingAlgorithm):
         if idx == -1:
             raise QgsProcessingException(f"Le champ '{col}' est introuvable dans la couche")
 
+        new_layer = inp.materialize(QgsFeatureRequest())
+        pr = new_layer.dataProvider()
+        new_layer.startEditing()
+        pr.addAttributes([ 
+                QgsField(FIELD_DENS, QVariant.Double)])
+        new_layer.updateFields()
 
-        fields = QgsFields(inp.fields())
-        fields.append(QgsField(FIELD_DENS, QVariant.Double))
 
-        geom_type_str = QgsWkbTypes.displayString(inp.wkbType())
-        mem_layer = QgsVectorLayer(
-            f"{geom_type_str}?crs={inp.crs().authid()}",
-            "pop_densite",
-            "memory"
-        )
-        mem_provider = mem_layer.dataProvider()
-        mem_provider.addAttributes(fields)
-        mem_layer.updateFields()
-
-        idx_dens = mem_layer.fields().indexFromName(FIELD_DENS)
+        idx_dens = new_layer.fields().indexFromName(FIELD_DENS)
 
 
         min_dens, max_dens = None, None
 
         new_features = []
 
-        for f in inp.getFeatures():
+        for f in new_layer.getFeatures():
             pop = f[idx]
             geom = f.geometry()
             area = d.measureArea(geom)
@@ -205,21 +199,16 @@ class RasterisationPop(QgsProcessingAlgorithm):
             else:
                 feedback.pushWarning(f"Feature {f.id()} : aire nulle, densité mise à 0")
                 densite = 0.0
+            f[idx_dens] = densite
 
-            new_feat = QgsFeature(fields)
-            new_feat.setGeometry(geom)
-            new_feat.setAttributes(f.attributes() + [densite])
-            new_features.append(new_feat)
+            
 
             min_dens = densite if min_dens is None else min(min_dens, densite)
             max_dens = densite if max_dens is None else max(max_dens, densite)
 
-        ok, _ = mem_provider.addFeatures(new_features)
 
 
-        if not ok:
-            raise QgsProcessingException("Échec de l'ajout des features à la couche mémoire")
-        mem_layer.updateExtents()
+        
         feedback.pushInfo(f"Densité (hab/km²) — min: {min_dens}, max: {max_dens}")
 
 
@@ -233,10 +222,10 @@ class RasterisationPop(QgsProcessingAlgorithm):
         #     inp.crs().authid()
         # )
 
-        print(mem_layer.featureCount())
+        print(new_layer.featureCount())
         raster = processing.run("gdal:rasterize", 
-                       {'INPUT': inp,
-                        'FIELD':'densité',
+                       {'INPUT': new_layer,
+                        'FIELD':FIELD_DENS,
                         'BURN':0,
                         'USE_Z':False,
                         'UNITS':1,

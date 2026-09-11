@@ -32,8 +32,12 @@ __revision__ = '$Format:%H$'
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (QgsProcessing,
+                       QgsExpression,
                        QgsFeatureSink,
+                       QgsFeatureRequest,
+                       QgsExpressionContext,
                        QgsProcessingAlgorithm,
+                       QgsExpressionContextUtils,
                        QgsProcessingParameterRasterLayer,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterRasterDestination,
@@ -41,7 +45,9 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingParameterField,
                        QgsProcessingParameterString,
                        QgsProcessingParameterEnum, 
-                       QgsProcessingParameterNumber)
+                       QgsProcessingParameterNumber,
+                       QgsFields,
+                       QgsField)
 
 from qgis.analysis import (
     QgsVectorLayerDirector,
@@ -65,6 +71,7 @@ class AMC(QgsProcessingAlgorithm):
     # calling from the QGIS console.
 
     OUTPUT = 'OUTPUT'
+    OUTPUT_VECTOR = 'OUTPUT_VECTOR'
     
     DEMANDE = 'DEMANDE'
     POIDS_D = 'POIDS_D'
@@ -172,6 +179,13 @@ class AMC(QgsProcessingAlgorithm):
             )
         )
         
+        self.addParameter(
+            QgsProcessingParameterFeatureSource(
+                self.ROUTES,
+                self.tr('Couche du réseau routier'),
+                [QgsProcessing.SourceType.TypeVectorLine]
+            )
+        )
         
         
         
@@ -181,6 +195,13 @@ class AMC(QgsProcessingAlgorithm):
                 'Couche de résultat'
             )
         )
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT_VECTOR,
+                'Couche de résultat'
+            )
+        )
+        
     
     def processAlgorithm(self, parameters, context, feedback):
         """
@@ -199,6 +220,8 @@ class AMC(QgsProcessingAlgorithm):
         reseau = self.parameterAsSource(parameters, self.RESEAU, context)
         poids_reseau = self.parameterAsDouble(parameters, self.POIDS_RES, context)
         
+        routes_layer = self.parameterAsSource(parameters, self.ROUTES, context)
+        
         
         
         
@@ -216,4 +239,41 @@ class AMC(QgsProcessingAlgorithm):
                             'RTYPE':5,'CREATION_OPTIONS':None,
                             'EXTRA':'',
                             'OUTPUT':parameters[self.OUTPUT]})
-        return {self.OUTPUT: result['OUTPUT']}
+        exp = QgsExpression("raster_value(result['OUTPUT'], 1, $geometry)")
+        new_layer = routes_layer.materialize(QgsFeatureRequest().setFilterFids(routes_layer.allFeatureIds()))
+
+        context = QgsExpressionContext()
+        context.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(new_layer))
+        
+        
+        
+        new_layer.startEditing()
+        for f in new_layer.getFeatures():
+            context.setFeature(f)
+            context.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(result['OUTPUT']))
+            f['Raster_value'] = exp.evaluate(context)
+            new_layer.updateFeature(f)
+        new_layer.commitChanges()
+        
+        expr = '("raster_values" > 0.5)'
+        feedback.pushInfo(f"Expression aménagements : {expr}")
+        request = QgsFeatureRequest().setFilterExpression(expr)
+        velo = new_layer.materialize(request)
+
+        
+        out_fields = QgsFields(new_layer.attributes)
+        out_fields.append(QgsField('raster_value', QVariant.Double))
+        
+        (sink, dest_id) = self.parameterAsSink(
+            parameters, self.OUTPUT_VECTOR, context,
+            out_fields, new_layer.wkbType(), new_layer.sourceCrs()
+        )
+        features = [f for f in velo.getFeatures()]
+        sink.addFeatures(features, QgsFeatureSink.FastInsert)
+        
+        results = {}
+        results[self.OUTPUT_VECTOR] = dest_id
+        results[self.OUTPUT] = result['OUTPUT']
+        
+        # On compare le raster avec le réseau routier
+        return {results}

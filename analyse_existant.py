@@ -78,16 +78,6 @@ def resolve_grass_alg(short_name):
             return alg.id()
     return None
 
-def build_expr(columns, is_not_null=True):
-    
-    if is_not_null:
-        op = "IS NOT NULL" 
-        conditions = [f'"{col}" {op}' for col in columns]
-        return " OR ".join(conditions)
-    else:
-        op = "IS NULL" 
-        conditions = [f'"{col}" {op}' for col in columns]
-        return " AND ".join(conditions)
 
 
 # Profils par source : pour chaque source de données connue, on associe à
@@ -113,9 +103,7 @@ SOURCE_PROFILES = {
         # Classe "Tronçon de route" : la piste cyclable en site propre est
         # une Nature à part entière ; les aménagements sur voirie partagée
         # (bande, voie verte, vélorue...) sont dans "Nature de la restriction".
-        # Les noms de champs shapefile peuvent être tronqués (10 caractères) :
-        # adapte 'nature' / 'nature_de_la_restriction' au nom réel dans ta couche.
-        'nature': ['Piste cyclable'],
+    
         'nature_de_la_restriction': [
             'Piste cyclable', 'Voie verte', 'Vélorue',
             'Chaussée à voie centrale banalisée',
@@ -182,6 +170,9 @@ class AnalyseExistant(QgsProcessingAlgorithm):
     COLAME = 'COLAME'
     SOURCE = 'SOURCE'
     VALEURS_PERSONNALISEES = 'VALEURS_PERSONNALISEES'
+    SEUIL_COMPOSANTES = 'SEUIL_COMPOSANTES'
+    SEUIL_JOINTURE = 'SEUIL_JOINTURE'
+
     
     
     OUTPUT = 'OUTPUT'
@@ -265,6 +256,33 @@ class AnalyseExistant(QgsProcessingAlgorithm):
         )
         
         self.addParameter(
+            QgsProcessingParameterNumber(
+                self.SEUIL_COMPOSANTES,
+                self.tr(
+                    "Seuil de fusion des composantes connexes (v.net.components, "
+                    "en unités du CRS du réseau)"
+                ),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=50,
+                minValue=0
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.SEUIL_JOINTURE,
+                self.tr(
+                    "Distance max. extrémité <-> aménagement existant "
+                    "(joinbynearest, en unités du CRS du réseau)"
+                ),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=70,
+                minValue=0
+            )
+        )
+
+        
+        self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT,
                 self.tr('Output raster')
@@ -276,6 +294,8 @@ class AnalyseExistant(QgsProcessingAlgorithm):
         """
         reseau = self.parameterAsSource(parameters, self.RESEAU, context)
         col_ame = self.parameterAsStrings(parameters, self.COLAME, context)
+        seuil_composantes = self.parameterAsDouble(parameters, self.SEUIL_COMPOSANTES, context)
+        seuil_jointure = self.parameterAsDouble(parameters, self.SEUIL_JOINTURE, context)
 
         source_idx = self.parameterAsEnum(parameters, self.SOURCE, context)
         source_name = self.SOURCE_OPTIONS[source_idx]
@@ -314,7 +334,7 @@ class AnalyseExistant(QgsProcessingAlgorithm):
             alg_id, 
             {'input':velo,
              'points':None,
-             'threshold':50,
+             'threshold':seuil_composantes,
              'method':0,
              'arc_column':'',
              'arc_backward_column':'',
@@ -368,7 +388,7 @@ class AnalyseExistant(QgsProcessingAlgorithm):
          'DISCARD_NONMATCHING': False,
          'PREFIX': 'velo_',
          'NEIGHBORS': 1,
-         'MAX_DISTANCE': 70,
+         'MAX_DISTANCE': seuil_jointure,
          'OUTPUT': 'memory:'}
         , context=context, feedback=feedback)['OUTPUT']
         #Plutôt qu'une jointure peut être trouver là où touche les bouts
@@ -445,21 +465,23 @@ class AnalyseExistant(QgsProcessingAlgorithm):
                 "Aucun chaînon manquant détecté : génération d'un raster "
                 "vide (valeur 0 partout) sur l'emprise du réseau "
             )
-            
+            reseau_materialise = reseau.materialize(QgsFeatureRequest())
+
             raster = processing.run("gdal:rasterize", 
-                       {'INPUT': reseau,
+                       {'INPUT': reseau_materialise,
                         'FIELD':'',
                         'BURN':0,
                         'USE_Z':False,
                         'UNITS':1,
                         'WIDTH':10,'HEIGHT':10,
-                        'EXTENT':None,'NODATA':0,
+                        'EXTENT':None,'NODATA':1,
                         'CREATION_OPTIONS':None,
-                        'DATA_TYPE':5,'INIT':None,
+                        'DATA_TYPE':5,'INIT':0,
                         'INVERT':False,'EXTRA':'',
                         'OUTPUT': QgsProcessingUtils.generateTempFilename(
                             'score_services_rasterized.tif', context)}
                        , context=context, feedback=feedback)['OUTPUT']
+            feedback.pushInfo("Rasterisation terminée")
         else:
             raster = processing.run("gdal:rasterize", 
                    {'INPUT': chainons_manquants,
@@ -484,12 +506,30 @@ class AnalyseExistant(QgsProcessingAlgorithm):
             raise RuntimeError(f"Impossible d'ouvrir le raster généré : {raster}")
 
         arr = ds.GetRasterBand(1).ReadAsArray().astype(float)
+        band = ds.GetRasterBand(1)
+        nodata_val = band.GetNoDataValue()
+        if nodata_val is not None:
+            arr = np.where(np.isclose(arr, nodata_val), np.nan, arr)
         r_min = float(np.nanmin(arr))
         r_max = float(np.nanmax(arr))
+
         feedback.pushInfo(f"score_services min={r_min}, max={r_max}")
-        if r_max == r_min:
+        if not np.isfinite(r_min) or not np.isfinite(r_max):
+            # r_min/r_max NaN (raster entièrement masqué en nodata) ou
+            # infini : une formule gdal_calc contenant "nan"/"inf" plante
+            # gdal_calc.bat (et peut même faire planter QGIS via un bug de
+            # décodage des messages GDAL localisés sous Windows). On bascule
+            # sur une normalisation neutre plutôt que de risquer ça.
+            feedback.pushWarning(
+                "Impossible de calculer min/max (raster entièrement nodata "
+                "ou vide) : normalisation ignorée, valeur 0 partout."
+            )
+            formula = "A*0"
+
+        elif r_max == r_min:
             feedback.pushWarning("Toutes les valeurs sont identiques, la normalisation est ignorée.")
             formula = "A*0"  # ou une autre valeur par défaut
+            
         else:
             formula = f"((A - {r_min}) / ({r_max} - {r_min})) * 100"
 
