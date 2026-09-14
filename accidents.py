@@ -37,6 +37,7 @@ from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
+    QgsProcessingException,
     QgsProcessingParameterVectorLayer,
     QgsProcessingParameterRasterLayer,
     QgsProcessingParameterNumber,
@@ -133,7 +134,7 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
     def processAlgorithm(self, parameters, context, feedback):
         lignes = self.parameterAsVectorLayer(parameters, self.ROADS, context)
         accidents = self.parameterAsVectorLayer(parameters, self.ACCIDENTS, context)
-        output_raster = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
+        output_path = self.parameterAsOutputLayer(parameters, self.OUTPUT, context) #string
         radius = self.parameterAsDouble(parameters, self.RADIUS, context)
         pixel_size = self.parameterAsDouble(parameters, self.PIXEL_SIZE, context)
         
@@ -169,7 +170,7 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
         px_w = gt[1]
         px_h = gt[5]
         
-        need_reproject = lignes.crs() != pois.crs()
+        need_reproject = lignes.crs() != accidents.crs()
         if need_reproject:
             feedback.pushWarning(
                 "Le CRS du réseau routier diffère de celui des PNT : "
@@ -178,7 +179,7 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
         transform = None
         if need_reproject:
             from qgis.core import QgsCoordinateTransform, QgsProject
-            transform = QgsCoordinateTransform(lignes.crs(), pois.crs(), QgsProject.instance())
+            transform = QgsCoordinateTransform(lignes.crs(), accidents.crs(), QgsProject.instance())
 
         
         total = lignes.featureCount()
@@ -191,11 +192,9 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
         pr = lignes.dataProvider()
         lignes.startEditing()
         pr.addAttributes([
-                QgsField("join_fid", QVariant.LongLong),
                 QgsField("score_services", QVariant.Double)])
         lignes.updateFields()
         
-        idx_join = lignes.fields().lookupField('join_fid')
         idx = lignes.fields().lookupField('score_services')
         mem_ogr_drv = ogr.GetDriverByName('Memory')
 
@@ -284,36 +283,57 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
                         'score_services_rasterized.tif', context)}
                    )['OUTPUT']
         
-        stats_ds = gdal.Open(raster)
-        stats_band = stats_ds.GetRasterBand(1)
-        stats = stats_band.GetStatistics(0, 1)  # [min, max, mean, stddev]
-        vmin, vmax = stats[0], stats[1]
-        stats_ds = None
-     
-        if vmax == vmin:
-            feedback.pushWarning(
-                "Tous les tronçons ont le même score : la normalisation 0-100 "
-                "est ignorée (raster de sortie mis à 0)."
-            )
-            formula = '(A*0)'
-        else:
-            formula = f'((A - {vmin}) / ({vmax} - {vmin}))*100'
-
-        calcul = processing.run("gdal:rastercalculator", 
-                       {'INPUT_A':raster,
-                        'BAND_A':1,
-                        'INPUT_B':None,'BAND_B':None,
-                        'INPUT_C':None,'BAND_C':None,
-                        'INPUT_D':None,'BAND_D':None,
-                        'INPUT_E':None,'BAND_E':None,
-                        'INPUT_F':None,'BAND_F':None,
-                        'FORMULA':formula,
-                        'NO_DATA':None,
-                        'EXTENT_OPT':0,'PROJWIN':None,
-                        'RTYPE':5,'CREATION_OPTIONS':None,
-                        'EXTRA':'',
-                        'OUTPUT':output_raster})
+        ds = gdal.Open(raster) if isinstance(raster, str) else raster
+        if ds is None:
+            raise RuntimeError(f"Impossible d'ouvrir le raster généré : {raster}")
+        band = ds.GetRasterBand(1)
+        arr = ds.GetRasterBand(1).ReadAsArray().astype(float)
+        feedback.pushInfo(f"Dimensions : {ds.RasterXSize} x {ds.RasterYSize} pixels")
+        feedback.pushInfo(f"NoData : {band.GetNoDataValue()}")
+        feedback.pushInfo(f"Min : {np.nanmin(arr)}, Max : {np.nanmax(arr)}, Moyenne : {np.nanmean(arr):.2f}")
+        feedback.pushInfo(f"Valeurs uniques (10 premières) : {np.unique(arr)[:10]}")
+        feedback.pushInfo(f"% de pixels à 0 : {(arr == 0).sum() / arr.size * 100:.1f}%")
         
-        return {self.OUTPUT: calcul['OUTPUT']}
+        nodata = band.GetNoDataValue()
+        if nodata is not None:
+            valid_mask = arr != nodata
+        else:
+            valid_mask = np.ones(arr.shape, dtype=bool)
+
+        if not valid_mask.any():
+            raise QgsProcessingException(
+                "Le raster ne contient aucune valeur valide (tout est NoData)."
+            )
+
+        r_min = float(arr[valid_mask].min())
+        r_max = float(arr[valid_mask].max())
+        feedback.pushInfo(f"Densité min={r_min}, max={r_max} (NoData exclu)")
+
+        if r_max == r_min:
+            feedback.pushWarning("Toutes les valeurs sont identiques, la normalisation est ignorée.")
+            norm = np.zeros_like(arr)
+        else:
+            norm = np.where(
+                valid_mask,
+                (arr - r_min) / (r_max - r_min) * 100,
+                nodata if nodata is not None else -9999
+            )
+
+       
+        driver = gdal.GetDriverByName('GTiff')
+        out_ds = driver.Create(
+            output_path, ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Float32
+        )
+        out_ds.SetGeoTransform(ds.GetGeoTransform())
+        out_ds.SetProjection(ds.GetProjection())
+        out_band = out_ds.GetRasterBand(1)
+        if nodata is not None:
+            out_band.SetNoDataValue(nodata)
+        out_band.WriteArray(norm.astype(np.float32))
+        out_band.FlushCache()
+        out_ds = None
+        ds = None
+        
+        return {self.OUTPUT: output_path}
 
     

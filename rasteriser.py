@@ -32,6 +32,8 @@ from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (QgsProcessing,
                        QgsFeatureRequest,
                        QgsFeatureSink,
+                       QgsProcessingUtils,
+                       QgsProcessingException,
                        QgsProcessingAlgorithm,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
@@ -57,10 +59,13 @@ from qgis.analysis import (
 )
 
 from qgis import processing
+from osgeo import gdal, ogr
+
 
 from collections import OrderedDict, defaultdict
 from scipy.spatial import cKDTree
 import pandas as pd
+import numpy as np
 
 class Rasterisation(QgsProcessingAlgorithm):
     """
@@ -143,8 +148,15 @@ class Rasterisation(QgsProcessingAlgorithm):
         output_path = self.parameterAsOutputLayer(parameters, self.OUTPUT, context) #string
 
         if col:
+            idx = inp.fields().lookupField(col)
+            if idx ==-1:
+                raise QgsProcessingException(f"Le champ '{col}' est introuvable dans la couche")
+
+            feedback.pushInfo(f"Colonne détectée : {col}")
+            new_layer = inp.materialize(QgsFeatureRequest())
+
             raster = processing.run("gdal:rasterize", 
-                       {'INPUT': inp,
+                       {'INPUT': new_layer,
                         'FIELD':col,
                         'BURN':0,
                         'USE_Z':False,
@@ -154,7 +166,8 @@ class Rasterisation(QgsProcessingAlgorithm):
                         'CREATION_OPTIONS':None,
                         'DATA_TYPE':5,'INIT':None,
                         'INVERT':False,'EXTRA':'',
-                        'OUTPUT':'memory:'})['OUTPUT']
+                        'OUTPUT':QgsProcessingUtils.generateTempFilename(
+                            'layer_rasterized.tif', context)})['OUTPUT']
         else:
             raster = processing.run("gdal:rasterize", 
                        {'INPUT': inp,
@@ -167,25 +180,63 @@ class Rasterisation(QgsProcessingAlgorithm):
                         'CREATION_OPTIONS':None,
                         'DATA_TYPE':5,'INIT':None,
                         'INVERT':False,'EXTRA':'',
-                        'OUTPUT':'memory:'})['OUTPUT']
+                        'OUTPUT':QgsProcessingUtils.generateTempFilename(
+                            'layer_rasterized.tif', context)})['OUTPUT']
         
-        result = processing.run("gdal:rastercalculator", 
-                       {'INPUT_A':raster,
-                        'BAND_A':1,
-                        'INPUT_B':None,'BAND_B':None,
-                        'INPUT_C':None,'BAND_C':None,
-                        'INPUT_D':None,'BAND_D':None,
-                        'INPUT_E':None,'BAND_E':None,
-                        'INPUT_F':None,'BAND_F':None,
-                        'FORMULA':'((A - A.min()) / (A.max() - A.min()))*100',
-                        'NO_DATA':None,
-                        'EXTENT_OPT':0,'PROJWIN':None,
-                        'RTYPE':5,'CREATION_OPTIONS':None,
-                        'EXTRA':'',
-                        'OUTPUT':'memory:'})
+        feedback.pushInfo('Rasterisation terminée !')
+        ds = gdal.Open(raster) if isinstance(raster, str) else raster
+        if ds is None:
+            raise RuntimeError(f"Impossible d'ouvrir le raster généré : {raster}")
+        band = ds.GetRasterBand(1)
+        arr = ds.GetRasterBand(1).ReadAsArray().astype(float)
+        feedback.pushInfo(f"Dimensions : {ds.RasterXSize} x {ds.RasterYSize} pixels")
+        feedback.pushInfo(f"NoData : {band.GetNoDataValue()}")
+        feedback.pushInfo(f"Min : {np.nanmin(arr)}, Max : {np.nanmax(arr)}, Moyenne : {np.nanmean(arr):.2f}")
+        feedback.pushInfo(f"Valeurs uniques (10 premières) : {np.unique(arr)[:10]}")
+        feedback.pushInfo(f"% de pixels à 0 : {(arr == 0).sum() / arr.size * 100:.1f}%")
+        
+        nodata = band.GetNoDataValue()
+        if nodata is not None:
+            valid_mask = arr != nodata
+        else:
+            valid_mask = np.ones(arr.shape, dtype=bool)
+
+        if not valid_mask.any():
+            raise QgsProcessingException(
+                "Le raster ne contient aucune valeur valide (tout est NoData)."
+            )
+
+        r_min = float(arr[valid_mask].min())
+        r_max = float(arr[valid_mask].max())
+        feedback.pushInfo(f"Densité min={r_min}, max={r_max} (NoData exclu)")
+
+        if r_max == r_min:
+            feedback.pushWarning("Toutes les valeurs sont identiques, la normalisation est ignorée.")
+            norm = np.zeros_like(arr)
+        else:
+            norm = np.where(
+                valid_mask,
+                (arr - r_min) / (r_max - r_min) * 100,
+                nodata if nodata is not None else -9999
+            )
+
+       
+        driver = gdal.GetDriverByName('GTiff')
+        out_ds = driver.Create(
+            output_path, ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Float32
+        )
+        out_ds.SetGeoTransform(ds.GetGeoTransform())
+        out_ds.SetProjection(ds.GetProjection())
+        out_band = out_ds.GetRasterBand(1)
+        if nodata is not None:
+            out_band.SetNoDataValue(nodata)
+        out_band.WriteArray(norm.astype(np.float32))
+        out_band.FlushCache()
+        out_ds = None
+        ds = None
         
         
         
-        return {self.OUTPUT: result['OUTPUT']}
+        return {self.OUTPUT: output_path}
         
         

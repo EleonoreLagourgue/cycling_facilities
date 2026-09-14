@@ -39,6 +39,7 @@ from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (QgsProcessing,
                        QgsFeatureRequest,
                        QgsFeatureSink,
+                       QgsRasterLayer,
                        QgsProcessingUtils,
                        QgsProcessingAlgorithm,
                        QgsProcessingParameterFeatureSource,
@@ -175,14 +176,10 @@ class RasterisationPop(QgsProcessingAlgorithm):
         pr.addAttributes([ 
                 QgsField(FIELD_DENS, QVariant.Double)])
         new_layer.updateFields()
-
-
         idx_dens = new_layer.fields().indexFromName(FIELD_DENS)
 
 
         min_dens, max_dens = None, None
-
-        new_features = []
 
         for f in new_layer.getFeatures():
             pop = f[idx]
@@ -200,78 +197,116 @@ class RasterisationPop(QgsProcessingAlgorithm):
                 feedback.pushWarning(f"Feature {f.id()} : aire nulle, densité mise à 0")
                 densite = 0.0
             f[idx_dens] = densite
-
+            new_layer.changeAttributeValue(f.id(), idx_dens, densite)
             
-
             min_dens = densite if min_dens is None else min(min_dens, densite)
             max_dens = densite if max_dens is None else max(max_dens, densite)
 
 
 
-        
+        if not new_layer.commitChanges():
+            raise QgsProcessingException(
+                "Impossible de committer les valeurs de densité sur la couche temporaire."
+            )
+        first_feature = next(new_layer.getFeatures(), None)
+        if first_feature is not None:
+            feedback.pushInfo(
+                f"Vérification — feature id {first_feature.id()} : "
+                f"densite = {first_feature[idx_dens]!r}"
+            )
+        else:
+            feedback.pushWarning("new_layer ne contient aucune entité après commit.")
+
         feedback.pushInfo(f"Densité (hab/km²) — min: {min_dens}, max: {max_dens}")
-
-
         
-        # extent = inp.extent()
-        # extent_str = '{},{},{},{} [{}]'.format(
-        #     extent.xMinimum(),
-        #     extent.xMaximum(),
-        #     extent.yMinimum(),
-        #     extent.yMaximum(),
-        #     inp.crs().authid()
-        # )
-
         print(new_layer.featureCount())
         raster = processing.run("gdal:rasterize", 
                        {'INPUT': new_layer,
-                        'FIELD':FIELD_DENS,
+                        'FIELD':'densite',
                         'BURN':0,
                         'USE_Z':False,
                         'UNITS':1,
-                        'WIDTH':10,'HEIGHT':10,
-                        'EXTENT':None,'NODATA':0,
+                        'WIDTH':20,'HEIGHT':20,
+                        'EXTENT':new_layer.extent(),'NODATA':-9999,
                         'CREATION_OPTIONS':None,
-                        'DATA_TYPE':5,'INIT':None,
+                        'DATA_TYPE':6,'INIT':None,
                         'INVERT':False,'EXTRA':'',
                         'OUTPUT':QgsProcessingUtils.generateTempFilename(
-                            'score_services_rasterized.tif', context)}, 
+                            'pop_rasterized.tif', context)}, 
                             context=context, feedback=feedback)['OUTPUT']
         
         print("Chemin raster:", repr(raster))
         import os
         print("Existe:", os.path.exists(raster))
         
+        # test_path = processing.run(
+        #     "native:rastercalc", 
+        #     {'LAYERS':[raster],
+        #      'EXPRESSION':f'(("{raster}@1"- MIN("{raster}@1"))/( MAX("{raster}@1")- MIN("{raster}@1")))*100',
+        #      'EXTENT':None,
+        #      'CELL_SIZE':None,
+        #      'CRS':None,
+        #      'CREATION_OPTIONS':None,'OUTPUT':QgsProcessingUtils.generateTempFilename(
+        #          'pop_norm.tif', context)}, 
+        #          context=context, feedback=feedback)["OUTPUT"]
+        # raster_check = QgsRasterLayer(test_path, 'pop_norm')
+        # if not raster_check.isValid():
+        #     feedback.reportError("Le raster normalisé n'est pas valide.")
+        
+        
         ds = gdal.Open(raster) if isinstance(raster, str) else raster
         if ds is None:
             raise RuntimeError(f"Impossible d'ouvrir le raster généré : {raster}")
-
+        band = ds.GetRasterBand(1)
         arr = ds.GetRasterBand(1).ReadAsArray().astype(float)
-        r_min = float(np.nanmin(arr))
-        r_max = float(np.nanmax(arr))
-        feedback.pushInfo(f"score_services min={r_min}, max={r_max}")
+        feedback.pushInfo(f"Dimensions : {ds.RasterXSize} x {ds.RasterYSize} pixels")
+        feedback.pushInfo(f"NoData : {band.GetNoDataValue()}")
+        feedback.pushInfo(f"Min : {np.nanmin(arr)}, Max : {np.nanmax(arr)}, Moyenne : {np.nanmean(arr):.2f}")
+        feedback.pushInfo(f"Valeurs uniques (10 premières) : {np.unique(arr)[:10]}")
+        feedback.pushInfo(f"% de pixels à 0 : {(arr == 0).sum() / arr.size * 100:.1f}%")
+        
+        nodata = band.GetNoDataValue()
+        if nodata is not None:
+            valid_mask = arr != nodata
+        else:
+            valid_mask = np.ones(arr.shape, dtype=bool)
+
+        if not valid_mask.any():
+            raise QgsProcessingException(
+                "Le raster ne contient aucune valeur valide (tout est NoData)."
+            )
+
+        r_min = float(arr[valid_mask].min())
+        r_max = float(arr[valid_mask].max())
+        feedback.pushInfo(f"Densité min={r_min}, max={r_max} (NoData exclu)")
+
         if r_max == r_min:
             feedback.pushWarning("Toutes les valeurs sont identiques, la normalisation est ignorée.")
-            formula = "A*0"  # ou une autre valeur par défaut
+            norm = np.zeros_like(arr)
         else:
-            formula = f"((A - {r_min}) / ({r_max} - {r_min})) * 100"
-            
-        result = processing.run("gdal:rastercalculator", 
-                       {'INPUT_A':raster,
-                        'BAND_A':1,
-                        'INPUT_B':None,'BAND_B':None,
-                        'INPUT_C':None,'BAND_C':None,
-                        'INPUT_D':None,'BAND_D':None,
-                        'INPUT_E':None,'BAND_E':None,
-                        'INPUT_F':None,'BAND_F':None,
-                        'FORMULA':formula,
-                        'NO_DATA':None,
-                        'EXTENT_OPT':0,'PROJWIN':None,
-                        'RTYPE':5,'CREATION_OPTIONS':None,
-                        'EXTRA':'',
-                        'OUTPUT':parameters[self.OUTPUT]},
-                       context=context, feedback=feedback)
+            norm = np.where(
+                valid_mask,
+                (arr - r_min) / (r_max - r_min) * 100,
+                nodata if nodata is not None else -9999
+            )
+
+       
+        driver = gdal.GetDriverByName('GTiff')
+        out_ds = driver.Create(
+            output_path, ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Float32
+        )
+        out_ds.SetGeoTransform(ds.GetGeoTransform())
+        out_ds.SetProjection(ds.GetProjection())
+        out_band = out_ds.GetRasterBand(1)
+        if nodata is not None:
+            out_band.SetNoDataValue(nodata)
+        out_band.WriteArray(norm.astype(np.float32))
+        out_band.FlushCache()
+        out_ds = None
+        ds = None
+
+        return {self.OUTPUT: output_path}
+
         
         
         
-        return {self.OUTPUT: result['OUTPUT']}

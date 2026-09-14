@@ -39,6 +39,7 @@ from qgis.PyQt.QtCore import QCoreApplication, QVariant
 
 from qgis.core import (
     QgsProcessing,
+    QgsFeatureRequest,
     QgsProcessingException,
     QgsProcessingAlgorithm,
     QgsProcessingParameterVectorLayer,
@@ -55,6 +56,7 @@ from qgis.core import (
 )
 from qgis import processing
 from osgeo import gdal, ogr
+import numpy as np
 
 class TripGenerationProcessor(QgsProcessingAlgorithm):
     ROADS = 'ROADS'
@@ -137,7 +139,7 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
 
         self.addParameter(
             QgsProcessingParameterRasterDestination(
-                self.OUTPUT, "Raster l'attractivité i.e. proximité aux services"
+                self.OUTPUT, "Raster d'attractivité i.e. proximité aux services"
             )
         )
 
@@ -147,6 +149,8 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
         poids = self.parameterAsString(parameters, self.WEIGHT_FIELD, context)
         radius = self.parameterAsDouble(parameters, self.RADIUS, context)
         pixel_size = self.parameterAsDouble(parameters, self.PIXEL_SIZE, context)
+        output_path = self.parameterAsOutputLayer(parameters, self.OUTPUT, context) #string
+
         
         if lignes_source is None or pois is None:
             raise QgsProcessingException("Couche(s) d'entrée invalide(s).")
@@ -161,7 +165,8 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
                 "Le rayon et la taille de pixel ne correspondent pas à des mètres."
             )
         
-        lignes = self._clone_layer(lignes_source, context, feedback)
+        lignes = lignes_source.materialize(QgsFeatureRequest())
+
 
 
 
@@ -194,6 +199,14 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
         rows = src_ds.RasterYSize
         band = src_ds.GetRasterBand(1)
         nodata = band.GetNoDataValue()
+        arr = src_ds.GetRasterBand(1).ReadAsArray().astype(float)
+        
+        feedback.pushInfo(f"Dimensions : {cols} x {rows} pixels")
+        feedback.pushInfo(f"NoData : {band.GetNoDataValue()}")
+        feedback.pushInfo(f"Min : {np.nanmin(arr)}, Max : {np.nanmax(arr)}, Moyenne : {np.nanmean(arr):.2f}")
+        feedback.pushInfo(f"Valeurs uniques (10 premières) : {np.unique(arr)[:10]}")
+        feedback.pushInfo(f"% de pixels à 0 : {(arr == 0).sum() / arr.size * 100:.1f}%")
+        
         
         px_w = gt[1]
         px_h = gt[5]
@@ -224,6 +237,7 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
         idx = lignes.fields().lookupField('score_services')
         mem_ogr_drv = ogr.GetDriverByName('Memory')
  
+        min_dens, max_dens = None, None
 
         for current, feature in enumerate(lignes.getFeatures()):
             if feedback.isCanceled():
@@ -248,8 +262,10 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
  
             win_cols = col_max - col_min
             win_rows = row_max - row_min
+            print(win_cols, win_rows)
             if win_cols <= 0 or win_rows <= 0:
-                pr.changeAttributeValues({feature.id(): {idx: 0.0}})
+                lignes.changeAttributeValue(feature.id(), idx, 0.0)
+
                 continue
  
             sub_gt = (
@@ -279,7 +295,12 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
                 pixels_values = pixels_values[pixels_values != nodata]
  
             score = float(pixels_values.mean()) if pixels_values.size > 0 else 0.0
-            pr.changeAttributeValues({feature.id(): {idx: score}})
+            #pr.changeAttributeValues({feature.id(): {idx: score}})
+            lignes.changeAttributeValue(feature.id(), idx, score)
+
+            
+            min_dens = score if min_dens is None else min(min_dens, score)
+            max_dens = score if max_dens is None else max(max_dens, score)
  
             # Libération explicite des objets GDAL/OGR temporaires
             mask_ds = None
@@ -288,11 +309,26 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
             if total > 0:
                 feedback.setProgress(int(current / total * 100))
  
-        lignes.commitChanges()
+    
+ 
+        if not lignes.commitChanges():
+            raise QgsProcessingException(
+                "Impossible de committer les valeurs de densité sur la couche temporaire."
+            )
 
-        
+        first_feature = next(lignes.getFeatures(), None)
+        if first_feature is not None:
+            feedback.pushInfo(
+                f"Vérification — feature id {first_feature.id()} : "
+                f"attractivté = {first_feature[idx]!r}"
+            )
+        else:
+            feedback.pushWarning("new_layer ne contient aucune entité après commit.")
 
 
+        # =============================================================================
+        #         Rasterisation
+        # =============================================================================
         raster = processing.run("gdal:rasterize", 
                    {'INPUT': lignes,
                     'FIELD':'score_services',
@@ -307,51 +343,59 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
                     'OUTPUT':QgsProcessingUtils.generateTempFilename(
                         'raster.tif', context)})['OUTPUT']
         
-        stats_ds = gdal.Open(raster)
-        stats_band = stats_ds.GetRasterBand(1)
-        stats = stats_band.GetStatistics(0, 1)  # [min, max, mean, stddev]
-        vmin, vmax = stats[0], stats[1]
-        stats_ds = None
-     
-        if vmax == vmin:
-            feedback.pushWarning(
-                "Tous les tronçons ont le même score : la normalisation 0-100 "
-                "est ignorée (raster de sortie mis à 0)."
-            )
-            formula = '(A*0)'
+        ds = gdal.Open(raster) if isinstance(raster, str) else raster
+        if ds is None:
+            raise RuntimeError(f"Impossible d'ouvrir le raster généré : {raster}")
+        band = ds.GetRasterBand(1)
+        arr = ds.GetRasterBand(1).ReadAsArray().astype(float)
+        feedback.pushInfo(f"Dimensions : {ds.RasterXSize} x {ds.RasterYSize} pixels")
+        feedback.pushInfo(f"NoData : {band.GetNoDataValue()}")
+        feedback.pushInfo(f"Min : {np.nanmin(arr)}, Max : {np.nanmax(arr)}, Moyenne : {np.nanmean(arr):.2f}")
+        feedback.pushInfo(f"Valeurs uniques (10 premières) : {np.unique(arr)[:10]}")
+        feedback.pushInfo(f"% de pixels à 0 : {(arr == 0).sum() / arr.size * 100:.1f}%")
+        
+        nodata = band.GetNoDataValue()
+        if nodata is not None:
+            valid_mask = arr != nodata
         else:
-            formula = f'((A - {vmin}) / ({vmax} - {vmin}))*100'
-        result = processing.run("gdal:rastercalculator", 
-                       {'INPUT_A':raster,
-                        'BAND_A':1,
-                        'INPUT_B':None,'BAND_B':None,
-                        'INPUT_C':None,'BAND_C':None,
-                        'INPUT_D':None,'BAND_D':None,
-                        'INPUT_E':None,'BAND_E':None,
-                        'INPUT_F':None,'BAND_F':None,
-                        'FORMULA': formula,
-                        'NO_DATA':None,
-                        'EXTENT_OPT':0,'PROJWIN':None,
-                        'RTYPE':5,'CREATION_OPTIONS':None,
-                        'EXTRA':'',
-                        'OUTPUT':parameters[self.OUTPUT]})
+            valid_mask = np.ones(arr.shape, dtype=bool)
 
-        return {self.OUTPUT: result['OUTPUT']}
-    def _clone_layer(self, layer, context, feedback):
-        """Retourne une copie mémoire de la couche pour ne jamais modifier
-        l'entrée fournie par l'utilisateur (reprojection vers son propre
-        CRS = simple moyen d'obtenir une copie mémoire indépendante via
-        les algos natifs de QGIS)."""
-        clone = processing.run(
-            "native:reprojectlayer",
-            {
-                'INPUT': layer,
-                'TARGET_CRS': layer.crs(),
-                'OUTPUT': 'memory:',
-            },
-            context=context, feedback=feedback
-        )['OUTPUT']
-        return clone
+        if not valid_mask.any():
+            raise QgsProcessingException(
+                "Le raster ne contient aucune valeur valide (tout est NoData)."
+            )
+
+        r_min = float(arr[valid_mask].min())
+        r_max = float(arr[valid_mask].max())
+        feedback.pushInfo(f"Densité min={r_min}, max={r_max} (NoData exclu)")
+
+        if r_max == r_min:
+            feedback.pushWarning("Toutes les valeurs sont identiques, la normalisation est ignorée.")
+            norm = np.zeros_like(arr)
+        else:
+            norm = np.where(
+                valid_mask,
+                (arr - r_min) / (r_max - r_min) * 100,
+                nodata if nodata is not None else -9999
+            )
+
+       
+        driver = gdal.GetDriverByName('GTiff')
+        out_ds = driver.Create(
+            output_path, ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Float32
+        )
+        out_ds.SetGeoTransform(ds.GetGeoTransform())
+        out_ds.SetProjection(ds.GetProjection())
+        out_band = out_ds.GetRasterBand(1)
+        if nodata is not None:
+            out_band.SetNoDataValue(nodata)
+        out_band.WriteArray(norm.astype(np.float32))
+        out_band.FlushCache()
+        out_ds = None
+        ds = None
+
+        return {self.OUTPUT: output_path}
+    
 
 
     

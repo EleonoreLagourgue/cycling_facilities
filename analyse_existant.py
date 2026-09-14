@@ -34,6 +34,7 @@ from qgis.core import (QgsProcessing,
                        QgsFeatureRequest,
                        QgsFeatureSink,
                        QgsProcessingAlgorithm,
+                       QgsProcessingException,
                        QgsProcessingParameterRasterDestination,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
@@ -300,6 +301,8 @@ class AnalyseExistant(QgsProcessingAlgorithm):
         source_idx = self.parameterAsEnum(parameters, self.SOURCE, context)
         source_name = self.SOURCE_OPTIONS[source_idx]
         valeurs_perso_str = self.parameterAsString(parameters, self.VALEURS_PERSONNALISEES, context)
+        output_path = self.parameterAsOutputLayer(parameters, self.OUTPUT, context) #string
+
 
         if source_name == 'Personnalisé':
             profile = None
@@ -507,47 +510,50 @@ class AnalyseExistant(QgsProcessingAlgorithm):
 
         arr = ds.GetRasterBand(1).ReadAsArray().astype(float)
         band = ds.GetRasterBand(1)
-        nodata_val = band.GetNoDataValue()
-        if nodata_val is not None:
-            arr = np.where(np.isclose(arr, nodata_val), np.nan, arr)
-        r_min = float(np.nanmin(arr))
-        r_max = float(np.nanmax(arr))
-
-        feedback.pushInfo(f"score_services min={r_min}, max={r_max}")
-        if not np.isfinite(r_min) or not np.isfinite(r_max):
-            # r_min/r_max NaN (raster entièrement masqué en nodata) ou
-            # infini : une formule gdal_calc contenant "nan"/"inf" plante
-            # gdal_calc.bat (et peut même faire planter QGIS via un bug de
-            # décodage des messages GDAL localisés sous Windows). On bascule
-            # sur une normalisation neutre plutôt que de risquer ça.
-            feedback.pushWarning(
-                "Impossible de calculer min/max (raster entièrement nodata "
-                "ou vide) : normalisation ignorée, valeur 0 partout."
-            )
-            formula = "A*0"
-
-        elif r_max == r_min:
-            feedback.pushWarning("Toutes les valeurs sont identiques, la normalisation est ignorée.")
-            formula = "A*0"  # ou une autre valeur par défaut
-            
+        feedback.pushInfo(f"Dimensions : {ds.RasterXSize} x {ds.RasterYSize} pixels")
+        feedback.pushInfo(f"NoData : {band.GetNoDataValue()}")
+        feedback.pushInfo(f"Min : {np.nanmin(arr)}, Max : {np.nanmax(arr)}, Moyenne : {np.nanmean(arr):.2f}")
+        feedback.pushInfo(f"Valeurs uniques (10 premières) : {np.unique(arr)[:10]}")
+        feedback.pushInfo(f"% de pixels à 0 : {(arr == 0).sum() / arr.size * 100:.1f}%")
+        nodata = band.GetNoDataValue()
+        if nodata is not None:
+            valid_mask = arr != nodata
         else:
-            formula = f"((A - {r_min}) / ({r_max} - {r_min})) * 100"
+            valid_mask = np.ones(arr.shape, dtype=bool)
 
-        calcul = processing.run("gdal:rastercalculator", 
-                       {'INPUT_A':raster,
-                        'BAND_A':1,
-                        'INPUT_B':None,'BAND_B':None,
-                        'INPUT_C':None,'BAND_C':None,
-                        'INPUT_D':None,'BAND_D':None,
-                        'INPUT_E':None,'BAND_E':None,
-                        'INPUT_F':None,'BAND_F':None,
-                        'FORMULA':formula,
-                        'NO_DATA':None,
-                        'EXTENT_OPT':0,'PROJWIN':None,
-                        'RTYPE':5,'CREATION_OPTIONS':None,
-                        'EXTRA':'',
-                        'OUTPUT':parameters[self.OUTPUT]}
-                       , context=context, feedback=feedback)
+        if not valid_mask.any():
+            raise QgsProcessingException(
+                "Le raster ne contient aucune valeur valide (tout est NoData)."
+            )
 
-        return {self.OUTPUT: calcul['OUTPUT']}
+        r_min = float(arr[valid_mask].min())
+        r_max = float(arr[valid_mask].max())
+        feedback.pushInfo(f"Densité min={r_min}, max={r_max} (NoData exclu)")
+
+        if r_max == r_min:
+            feedback.pushWarning("Toutes les valeurs sont identiques, la normalisation est ignorée.")
+            norm = np.zeros_like(arr)
+        else:
+            norm = np.where(
+                valid_mask,
+                (arr - r_min) / (r_max - r_min) * 100,
+                nodata if nodata is not None else -9999
+            )
+
+       
+        driver = gdal.GetDriverByName('GTiff')
+        out_ds = driver.Create(
+            output_path, ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Float32
+        )
+        out_ds.SetGeoTransform(ds.GetGeoTransform())
+        out_ds.SetProjection(ds.GetProjection())
+        out_band = out_ds.GetRasterBand(1)
+        if nodata is not None:
+            out_band.SetNoDataValue(nodata)
+        out_band.WriteArray(norm.astype(np.float32))
+        out_band.FlushCache()
+        out_ds = None
+        ds = None
+
+        return {self.OUTPUT:output_path}
     

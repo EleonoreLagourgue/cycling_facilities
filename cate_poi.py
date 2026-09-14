@@ -130,7 +130,7 @@ class CateServices(QgsProcessingAlgorithm):
             'Sport',                                      'F1',        '0.78', '4',
             'Loisirs',                                    'F2',        '0.82', '4',
             'Culture',                                    'F3',        '0.73', '4',   
-            'Tourisme',                                   'G%',        '0.80', '4',  
+            'Tourisme',                                   'G%',        '0.50', '4',  
         ])
         self.addParameter(matrix_param,)
 
@@ -162,9 +162,10 @@ class CateServices(QgsProcessingAlgorithm):
             name = matrix[i]
             values_raw = matrix[i + 1]
             try:
-                threshold = int(matrix[i + 2])
+                poids = float(matrix[i + 2])
             except (ValueError, TypeError):
-                threshold = None
+                poids = None
+            print(poids)
             try:
                 speed = float(matrix[i + 3])
             except (ValueError, TypeError):
@@ -179,7 +180,7 @@ class CateServices(QgsProcessingAlgorithm):
                 'id': (i // 4) + 1,
                 'nom': name,
                 'valeurs': patterns,
-                'poids': threshold,
+                'poids': poids,
                 'vitesse': speed
             })
 
@@ -187,7 +188,7 @@ class CateServices(QgsProcessingAlgorithm):
         out_fields = QgsFields()
         out_fields.append(QgsField('category_id', QVariant.Int))
         out_fields.append(QgsField('category_name', QVariant.String))
-        out_fields.append(QgsField('poids', QVariant.Int))
+        out_fields.append(QgsField('poids', QVariant.Double))
         out_fields.append(QgsField('vitesse_kmh', QVariant.Double))
 
         (sink, dest_id) = self.parameterAsSink(
