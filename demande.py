@@ -174,27 +174,38 @@ class Demande(QgsProcessingAlgorithm):
         # to uniquely identify the feature sink, and must be included in the
         # dictionary returned by the processAlgorithm function.
         
-        pnt = self.parameterAsSource(parameters, self.PNT, context)
+        pnt = self.parameterAsRasterLayer(parameters, self.PNT, context)
         poids_pnt = self.parameterAsDouble(parameters, self.POIDS_PNT, context)
         
-        pop = self.parameterAsSource(parameters, self.POP, context)
+        pop = self.parameterAsRasterLayer(parameters, self.POP, context)
         poids_pop = self.parameterAsDouble(parameters, self.POIDS_POP, context)
         
+        formula = f'{poids_pop}*"{pop.name()}@1" + {poids_pnt}*"{pnt.name()}@1"'
         
-        # processing.run("native:rastercalc", 
-        #                {'LAYERS':
-        #             ['C:/Users/eleonore.lagourgue/Documents/stage_Eleonore/Sujet1_cyclable/donnees/donnees_creees/MNT_pente.tif',
-        #              'wms://http-header:referer=&type=xyz&url=https://tile.openstreetmap.org/%7Bz%7D/%7Bx%7D/%7By%7D.png&zmax=19&zmin=0'],
-        #             'EXPRESSION':'"MNT_pente@1" * 0.5 + "OpenStreetMap@1" * 0.5',
-        #             'EXTENT':None,'CELL_SIZE':None,
-        #             'CRS':None,'CREATION_OPTIONS':None,
-        #             'OUTPUT':'TEMPORARY_OUTPUT'})
-        result = processing.run("gdal:rastercalculatorc", 
-                       {"INPUT_A": pop, "BAND_A": 1,
-                        "INPUT_B": pnt, "BAND_B": 1,
-                        "FORMULA": f"({poids_pop}*A + {poids_pnt}*B)",
-                        "NO_DATA": -9999, 'PROJWIN':None,
-                        'RTYPE':5,'CREATION_OPTIONS':None,
-                        'EXTRA':'',
-                        'OUTPUT':parameters[self.OUTPUT]})
+        result = processing.run(
+        "native:rastercalc",
+        {
+            "LAYERS": [pop, pnt],
+            "EXPRESSION": formula,
+            "EXTENT": pop.extent(),
+            "CELL_SIZE": pop.rasterUnitsPerPixelX(),
+            "CRS": pop.crs(),
+            "OUTPUT": parameters[self.OUTPUT],
+        },
+        context=context,
+        feedback=feedback,
+        is_child_algorithm=True,
+    )
+        
+       
+        # result = processing.run("gdal:rastercalculator", 
+        #                {"INPUT_A": parameters[self.POP], "BAND_A": 1,
+        #                 "INPUT_B": parameters[self.PNT], "BAND_B": 1,
+        #                 "FORMULA": f"({poids_pop}*A + {poids_pnt}*B)",
+        #                 "NO_DATA": -9999, 'PROJWIN':None,
+        #                 'RTYPE':5,'CREATION_OPTIONS':None,
+        #                 'EXTRA':'',
+        #                 'OUTPUT':parameters[self.OUTPUT]},
+        #                context=context,
+        #                feedback=feedback,is_child_algorithm=True)
         return {self.OUTPUT: result['OUTPUT']}

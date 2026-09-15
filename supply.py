@@ -237,27 +237,25 @@ class BLOS(QgsProcessingAlgorithm):
         # dictionary returned by the processAlgorithm function.
         
         # Variables d'environnement
-        trafic = self.parameterAsSource(parameters, self.TRAFIC, context)
+        trafic = self.parameterAsRasterLayer(parameters, self.TRAFIC, context)
         poids_trafic = self.parameterAsDouble(parameters, self.POIDS_TRA, context)
-        trafic_pl = self.parameterAsSource(parameters, self.TRAFIC_PL, context)
+        trafic_pl = self.parameterAsRasterLayer(parameters, self.TRAFIC_PL, context)
         poids_pl = self.parameterAsDouble(parameters, self.POIDS_PL, context)
-        accidents = self.parameterAsSource(parameters, self.ACCIDENTS, context)
+        accidents = self.parameterAsRasterLayer(parameters, self.ACCIDENTS, context)
         poids_accident = self.parameterAsDouble(parameters, self.POIDS_ACC, context)
         
         
-        vitesse = self.parameterAsSource(parameters, self.VITESSE, context)
+        vitesse = self.parameterAsRasterLayer(parameters, self.VITESSE, context)
         poids_vitesse = self.parameterAsDouble(parameters, self.POIDS_VIT, context)
-        pente = self.parameterAsSource(parameters, self.PENTE, context)
+        pente = self.parameterAsRasterLayer(parameters, self.PENTE, context)
         poids_pente = self.parameterAsDouble(parameters, self.POIDS_PEN, context)
-        
+        formula = f'{poids_trafic}*"{trafic.name()}@1" + {poids_accident}*"{accidents.name()}@1" +"{vitesse.name()}@1"*{poids_vitesse} + "{pente.name()}@1"*{poids_pente} + "{trafic_pl.name()}@1"*{poids_pl}'
+
         
         
         result = processing.run("native:rastercalc", 
-                       {'LAYERS':
-                        [trafic,trafic_pl, accidents,
-                          vitesse, pente],
-                        'EXPRESSION':
-f'{trafic}*{poids_trafic} + {poids_accident}*{accidents} +{vitesse}*{poids_vitesse} + {pente}*{poids_pente} + {trafic_pl}*{poids_pl}',
+                       {'LAYERS':[trafic,trafic_pl, accidents, vitesse, pente],
+                        'EXPRESSION':formula,
                         'EXTENT':None,
                         'CELL_SIZE':None,
                         'CRS':None,

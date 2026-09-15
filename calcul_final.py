@@ -35,6 +35,7 @@ from qgis.core import (QgsProcessing,
                        QgsExpression,
                        QgsFeatureSink,
                        QgsFeatureRequest,
+                       QgsProcessingUtils,
                        QgsExpressionContext,
                        QgsProcessingAlgorithm,
                        QgsExpressionContextUtils,
@@ -57,7 +58,7 @@ from qgis.analysis import (
     QgsGraphAnalyzer
 )
 from qgis import processing
-
+import math
 
 
 class AMC(QgsProcessingAlgorithm):
@@ -150,6 +151,9 @@ class AMC(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.POIDS_RES,
                 self.tr('Poids de connectivité réseau'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=1/3,
+                minValue=0.0,
             )
         )
         
@@ -163,6 +167,9 @@ class AMC(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.POIDS_D,
                 self.tr('Poids de la demande'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=1/3,
+                minValue=0.0,
             )
         )
         
@@ -176,6 +183,9 @@ class AMC(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.POIDS_O,
                 self.tr('Poids de l"offre'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=1/3,
+                minValue=0.0,
             )
         )
         
@@ -213,67 +223,71 @@ class AMC(QgsProcessingAlgorithm):
         # dictionary returned by the processAlgorithm function.
         
         # Variables d'environnement
-        offre = self.parameterAsSource(parameters, self.OFFRE, context)
-        poids_offre = self.parameterAsDouble(parameters, self.POIDS_TRA, context)
-        demande = self.parameterAsSource(parameters, self.TRAFIC_PL, context)
-        poids_demande = self.parameterAsDouble(parameters, self.POIDS_PL, context)
-        reseau = self.parameterAsSource(parameters, self.RESEAU, context)
+        offre = self.parameterAsRasterLayer(parameters, self.OFFRE, context)
+        poids_offre = self.parameterAsDouble(parameters, self.POIDS_O, context)
+        demande = self.parameterAsRasterLayer(parameters, self.DEMANDE, context)
+        poids_demande = self.parameterAsDouble(parameters, self.POIDS_D, context)
+        reseau = self.parameterAsRasterLayer(parameters, self.RESEAU, context)
         poids_reseau = self.parameterAsDouble(parameters, self.POIDS_RES, context)
         
         routes_layer = self.parameterAsSource(parameters, self.ROUTES, context)
         
+        print(type(reseau))
         
         
+        if not math.isclose(somme, 1.0, rel_tol=1e-6, abs_tol=1e-9):
+            feedback.pushWarning("La somme des scores est différente de 1 !")
         
-        if poids_reseau + poids_demande+poids_offre != 1:
-            feedback.reportError("La somme des scores est différente de 1 !")
         
-        
-            
-        result = processing.run("gdal:rastercalculator", 
-                           {"INPUT_A": offre, "BAND_A": 1,
-                            "INPUT_B": demande, "BAND_B": 1,
-                            "INPUT_C": reseau, "BAND_C": 1,
-                            "FORMULA": f"({poids_offre}*A + {poids_demande}*B + {poids_reseau}*C)",
-                            "NO_DATA": -9999, 'PROJWIN':None,
-                            'RTYPE':5,'CREATION_OPTIONS':None,
-                            'EXTRA':'',
-                            'OUTPUT':parameters[self.OUTPUT]})
-        exp = QgsExpression("raster_value(result['OUTPUT'], 1, $geometry)")
-        new_layer = routes_layer.materialize(QgsFeatureRequest().setFilterFids(routes_layer.allFeatureIds()))
+        formula = f'{poids_offre}*"{offre.name()}@1" + {poids_demande}*"{demande.name()}@1" + {poids_reseau}*"{reseau.name()}@1"'
 
-        context = QgsExpressionContext()
-        context.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(new_layer))
         
+        result = processing.run(
+        "native:rastercalc",
+        {
+            "LAYERS": [offre, demande,reseau],
+            "EXPRESSION": formula,
+            "EXTENT": offre.extent(),
+            "CELL_SIZE": offre.rasterUnitsPerPixelX(),
+            "CRS": offre.crs(),
+            "OUTPUT": parameters[self.OUTPUT],
+        },
+        context=context,
+        feedback=feedback,
+        is_child_algorithm=True,
+    )
+        result_layer = QgsProcessingUtils.mapLayerFromString(result['OUTPUT'], context)
+        provider = result_layer.dataProvider()
         
-        
+        new_layer = routes_layer.materialize(QgsFeatureRequest().setFilterFids(routes_layer.allFeatureIds()))
         new_layer.startEditing()
+        new_layer.addAttribute(QgsField('raster_value', QVariant.Double))
+        new_layer.updateFields()
+
+        
+        
+        idx = new_layer.fields().indexOf('raster_value')
         for f in new_layer.getFeatures():
-            context.setFeature(f)
-            context.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(result['OUTPUT']))
-            f['Raster_value'] = exp.evaluate(context)
-            new_layer.updateFeature(f)
+            point = f.geometry().centroid().asPoint()
+            value, ok = provider.sample(point, 1)
+            new_layer.changeAttributeValue(f.id(), idx, value if ok else None)
         new_layer.commitChanges()
         
-        expr = '("raster_values" > 0.5)'
+        expr = 'raster_value > 50'
         feedback.pushInfo(f"Expression aménagements : {expr}")
         request = QgsFeatureRequest().setFilterExpression(expr)
         velo = new_layer.materialize(request)
 
-        
-        out_fields = QgsFields(new_layer.attributes)
-        out_fields.append(QgsField('raster_value', QVariant.Double))
-        
         (sink, dest_id) = self.parameterAsSink(
             parameters, self.OUTPUT_VECTOR, context,
-            out_fields, new_layer.wkbType(), new_layer.sourceCrs()
+            new_layer.fields(), new_layer.wkbType(), new_layer.sourceCrs()
         )
         features = [f for f in velo.getFeatures()]
         sink.addFeatures(features, QgsFeatureSink.FastInsert)
-        
+
         results = {}
         results[self.OUTPUT_VECTOR] = dest_id
         results[self.OUTPUT] = result['OUTPUT']
         
         # On compare le raster avec le réseau routier
-        return {results}
+        return results

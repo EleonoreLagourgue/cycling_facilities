@@ -71,6 +71,9 @@ class AjoutTrafic(QgsProcessingAlgorithm):
     SPEED_FIELD = 'SPEED_FIELD'
     DIRECTION_FIELD = 'DIRECTION_FIELD'
     TRAFIC_PL = 'TRAFIC_PL'
+    NATURE_FIELD = 'NATURE_FIELD'
+
+    
 
     
     def name(self):
@@ -137,6 +140,10 @@ class AjoutTrafic(QgsProcessingAlgorithm):
                                                       parentLayerParameterName=self.RESEAU,
                                                       optional= False))
         
+        self.addParameter(QgsProcessingParameterField(self.NATURE_FIELD, 
+                                                      self.tr("Colonne de nature ou d'importance"),
+                                                      parentLayerParameterName=self.RESEAU,
+                                                      optional= False))
         self.addParameter(QgsProcessingParameterField(self.SPEED_FIELD, 
                                                       self.tr("Colonne trafic"), 
                                                       parentLayerParameterName=self.INPUT,
@@ -145,6 +152,7 @@ class AjoutTrafic(QgsProcessingAlgorithm):
                                                        self.tr("Colonne trafic poids lourds (si existe)"), 
                                                        parentLayerParameterName=self.INPUT,
                                                        optional=True))
+        
        
         
         self.addParameter(
@@ -179,6 +187,7 @@ class AjoutTrafic(QgsProcessingAlgorithm):
         field_trafic = self.parameterAsString(parameters, self.SPEED_FIELD, context)
         field_nom = self.parameterAsString(parameters, self.DIRECTION_FIELD, context)
         field_pl = self.parameterAsString(parameters, self.TRAFIC_PL, context)
+        field_nature = self.parameterAsString(parameters, self.NATURE_FIELD, context)
 
         
         new_layer = source.materialize(QgsFeatureRequest().setFilterFids(source.allFeatureIds()))
@@ -273,7 +282,31 @@ class AjoutTrafic(QgsProcessingAlgorithm):
             geom = feats[fid].geometry()
             line = geom.asMultiPolyline()[0] if geom.isMultipart() else geom.asPolyline()
             return (line[0], line[-1])
-    
+        def get_rank(value):
+            """
+            Retourne un rang numérique où 0 = le plus important.
+            Gère à la fois:
+              - une chaîne de caractères (nature de la voie)
+              - un entier 1-6 (champ 'importance' de la BD Topo, 1 = le plus important)
+            """
+            PRIORITY_ORDER = ["Autoroute", "Nationale", "Départementale", "primary", "primary_link"]
+            if value is None:
+                return len(PRIORITY_ORDER) + 6  # inconnu = le moins prioritaire possible
+        
+            # Cas numérique (importance BD Topo, 1 à 6)
+            if isinstance(value, (int, float)):
+                return int(value) - 1  # 1 -> 0, 2 -> 1, ..., 6 -> 5
+        
+            # Cas chaîne numérique éventuelle ("3" au lieu de 3)
+            if isinstance(value, str) and value.strip().isdigit():
+                return int(value.strip()) - 1
+        
+            # Cas chaîne de caractères type "Autoroute", "primary", etc.
+            try:
+                return PRIORITY_ORDER.index(value)
+            except ValueError:
+                return len(PRIORITY_ORDER) + 6 
+                
         # index des noeuds : {coord arrondie: [fid, fid, ...]}
         vertex_index = {}
         for fid in feats.keys():
@@ -289,13 +322,46 @@ class AjoutTrafic(QgsProcessingAlgorithm):
             current_fid = queue.pop(0)
             current_val = feats[current_fid][field_trafic]
             current_nom = feats[current_fid][field_nom]
+            current_nature = feats[current_fid][field_nature]
+            rank = get_rank(current_nature)
     
             for pt in endpoints(current_fid):
                 key = (round(pt.x(), precision), round(pt.y(), precision))
                 neighbors = vertex_index.get(key, [])
     
                 if len(neighbors) > 2:
-                    continue  #vraie intersection -> on ne propage pas à travers ce noeud
+                    blocked = False
+                    for n_fid in neighbors:
+                        if n_fid == current_fid:
+                            continue
+                        n_feat = feats[n_fid]
+                        if n_feat[field_nom] == current_nom:
+                            continue  # même nom, pas une "autre route"
+                        nature = n_feat[field_nature]
+                        n_rank = get_rank(nature)
+                        if n_rank<= rank :
+                            blocked = True
+                            break
+                        if blocked:
+                            continue  # vraie intersection avec un axe important, on ne propage pas ici
+                
+                        #Propager la valeur aux tronçons de même nom sans valeur
+                        for n_fid in neighbors:
+                            if n_fid == current_fid:
+                                continue
+                            n_feat = feats[n_fid]
+                
+                            if n_feat[field_trafic] not in (None, 'NULL'):
+                                continue  # déjà une valeur
+                
+                            if n_feat[field_nom] != current_nom:
+                                continue  # nom différent, on ne propage pas
+    
+                    result.changeAttributeValue(n_fid, idx_trafic, current_val)
+                    n_feat.setAttribute(idx_trafic, current_val)
+                    queue.append(n_fid)
+                                
+                      #vraie intersection -> on ne propage pas à travers ce noeud
     
                 for n_fid in neighbors:
                     if n_fid == current_fid:
@@ -329,5 +395,8 @@ class AjoutTrafic(QgsProcessingAlgorithm):
         # statistics, etc. These should all be included in the returned
         # dictionary, with keys matching the feature corresponding parameter
         # or output names.
+        
+        
+        
         return {self.OUTPUT: dest_id}
 
