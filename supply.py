@@ -151,7 +151,7 @@ class BLOS(QgsProcessingAlgorithm):
                 self.POIDS_TRA,
                 self.tr('Poids du trafic'),
                 type=QgsProcessingParameterNumber.Double,
-                defaultValue=0.5,
+                defaultValue=1/6,
                 minValue=0.0,
             )
         )
@@ -167,7 +167,7 @@ class BLOS(QgsProcessingAlgorithm):
                 self.POIDS_ACC,
                 self.tr('Poids des accidents'),
                 type=QgsProcessingParameterNumber.Double,
-                defaultValue=0.5,
+                defaultValue=1/6,
                 minValue=0.0,
             )
         )
@@ -183,7 +183,7 @@ class BLOS(QgsProcessingAlgorithm):
                 self.POIDS_PL,
                 self.tr('Poids pour les PL'),
                 type=QgsProcessingParameterNumber.Double,
-                defaultValue=0.5,
+                defaultValue=1/6,
                 minValue=0.0,
             )
         )
@@ -199,7 +199,7 @@ class BLOS(QgsProcessingAlgorithm):
                 self.POIDS_VIT,
                 self.tr('Poids de la vitesse'),
                 type=QgsProcessingParameterNumber.Double,
-                defaultValue=0.5,
+                defaultValue=1/6,
                 minValue=0.0,
             )
         )
@@ -215,7 +215,22 @@ class BLOS(QgsProcessingAlgorithm):
                 self.POIDS_PEN,
                 self.tr('Poids de la pente'),
                 type=QgsProcessingParameterNumber.Double,
-                defaultValue=0.5,
+                defaultValue=1/6,
+                minValue=0.0,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                self.LARG_ROUTE,
+                self.tr('Raster de la lageur des routes'),
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.POIDS_LAR,
+                self.tr('Poids de la largeur'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=1/6,
                 minValue=0.0,
             )
         )

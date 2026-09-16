@@ -38,6 +38,7 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterRasterDestination,
     QgsFeature,
     QgsFeatureSink,
     QgsField,
@@ -57,6 +58,7 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
     BAND = "BAND"
     TOLERANCE = "TOLERANCE"
     AS_PERCENT = "AS_PERCENT"
+    VAE = "VAE"
     OUTPUT = "OUTPUT"
  
     def tr(self, string):
@@ -133,8 +135,16 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
                 defaultValue=True,
             )
         )
+        
         self.addParameter(
-            QgsProcessingParameterFeatureSink(self.OUTPUT, self.tr("Réseau avec pentes"))
+            QgsProcessingParameterBoolean(
+                self.VAE,
+                self.tr("VAE"),
+                defaultValue=False,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterRasterDestination(self.OUTPUT, self.tr("Raster de pente"))
         )
  
     def _endpoints(self, geom):
@@ -160,6 +170,8 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
         band = self.parameterAsInt(parameters, self.BAND, context)
         tol = self.parameterAsDouble(parameters, self.TOLERANCE, context)
         as_percent = self.parameterAsBool(parameters, self.AS_PERCENT, context)
+        vae = self.parameterAsBool(parameters, self.VAE, context)
+
  
         if tol <= 0:
             tol = 0.01  # évite une division par zéro dans l'arrondi
@@ -292,20 +304,34 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
                         'INVERT':False,'EXTRA':'',
                         'OUTPUT':'memory:'})['OUTPUT']
         
-        result = processing.run("gdal:rastercalculator", 
-                       {'INPUT_A':raster,
-                        'BAND_A':1,
-                        'INPUT_B':None,'BAND_B':None,
-                        'INPUT_C':None,'BAND_C':None,
-                        'INPUT_D':None,'BAND_D':None,
-                        'INPUT_E':None,'BAND_E':None,
-                        'INPUT_F':None,'BAND_F':None,
-                        'FORMULA':'IF(A<3,100,IF(A>8,0,((A - 3) / (8-3)*100)))',
-                        'NO_DATA':None,
-                        'EXTENT_OPT':0,'PROJWIN':None,
-                        'RTYPE':5,'CREATION_OPTIONS':None,
-                        'EXTRA':'',
-                        'OUTPUT':parameters[self.OUTPUT]})
+        
+        if vae:
+            formula = f'if( "{raster.name()}@1"<5,100, if("{raster.name()}@1">10,0,(("{raster.name()}@1" - 5) / (10-5)*100)))'
+            result = processing.run(
+                "native:rastercalc", 
+                {'LAYERS':[''],
+                 'EXPRESSION':formula,
+                 'EXTENT':None,'CELL_SIZE':10,
+                 'CRS':None,'CREATION_OPTIONS':None,
+                 'OUTPUT':parameters[self.OUTPUT]},
+                context=context,
+                feedback=feedback,
+                is_child_algorithm=True,)
+
+            
+        else:
+            formula = f'if( "{raster.name()}@1"<3,100, if("{raster.name()}@1">10,0,(("{raster.name()}@1" - 3) / (8-3)*100)))'
+            result = processing.run(
+                "native:rastercalc", 
+                {'LAYERS':[''],
+                 'EXPRESSION':formula,
+                 'EXTENT':None,'CELL_SIZE':10,
+                 'CRS':None,'CREATION_OPTIONS':None,
+                 'OUTPUT':parameters[self.OUTPUT]},
+                context=context,
+                feedback=feedback,
+                is_child_algorithm=True,)
+
         
  
         return {self.OUTPUT: result}

@@ -37,6 +37,7 @@ from qgis.core import (QgsProcessing,
                        QgsFeatureRequest,
                        QgsProcessingUtils,
                        QgsExpressionContext,
+                       QgsProcessingException,
                        QgsProcessingAlgorithm,
                        QgsExpressionContextUtils,
                        QgsProcessingParameterRasterLayer,
@@ -58,8 +59,10 @@ from qgis.analysis import (
     QgsGraphAnalyzer
 )
 from qgis import processing
-import math
+from osgeo import gdal, ogr
 
+import math
+import numpy as np
 
 class AMC(QgsProcessingAlgorithm):
     """
@@ -85,6 +88,8 @@ class AMC(QgsProcessingAlgorithm):
     
     PENTE = 'PENTE'
     POIDS_PEN = 'POIDS_PEN'
+    
+    
     
     
     ROUTES = 'ROUTES'
@@ -234,7 +239,7 @@ class AMC(QgsProcessingAlgorithm):
         
         print(type(reseau))
         
-        
+        somme = poids_demande + poids_offre + poids_reseau
         if not math.isclose(somme, 1.0, rel_tol=1e-6, abs_tol=1e-9):
             feedback.pushWarning("La somme des scores est différente de 1 !")
         
@@ -257,32 +262,131 @@ class AMC(QgsProcessingAlgorithm):
         is_child_algorithm=True,
     )
         result_layer = QgsProcessingUtils.mapLayerFromString(result['OUTPUT'], context)
-        provider = result_layer.dataProvider()
+        pr = result_layer.dataProvider()
         
         new_layer = routes_layer.materialize(QgsFeatureRequest().setFilterFids(routes_layer.allFeatureIds()))
         new_layer.startEditing()
         new_layer.addAttribute(QgsField('raster_value', QVariant.Double))
         new_layer.updateFields()
+        idx = new_layer.fields().indexOf('raster_value')
 
         
+        # --- Ouvrir le raster source avec GDAL ---
+        src_ds = gdal.Open(result["OUTPUT"])
+        gt = src_ds.GetGeoTransform()
+        proj = src_ds.GetProjection()
+        cols = src_ds.RasterXSize
+        rows = src_ds.RasterYSize
+        band = src_ds.GetRasterBand(1)
+        nodata = band.GetNoDataValue()
+        arr = src_ds.GetRasterBand(1).ReadAsArray().astype(float)
         
-        idx = new_layer.fields().indexOf('raster_value')
-        for f in new_layer.getFeatures():
-            point = f.geometry().centroid().asPoint()
-            value, ok = provider.sample(point, 1)
-            new_layer.changeAttributeValue(f.id(), idx, value if ok else None)
-        new_layer.commitChanges()
+        feedback.pushInfo(f"Dimensions : {cols} x {rows} pixels")
+        feedback.pushInfo(f"NoData : {band.GetNoDataValue()}")
+        feedback.pushInfo(f"Min : {np.nanmin(arr)}, Max : {np.nanmax(arr)}, Moyenne : {np.nanmean(arr):.2f}")
+        feedback.pushInfo(f"Valeurs uniques (10 premières) : {np.unique(arr)[:10]}")
+        feedback.pushInfo(f"% de pixels à 0 : {(arr == 0).sum() / arr.size * 100:.1f}%")
         
-        expr = 'raster_value > 50'
-        feedback.pushInfo(f"Expression aménagements : {expr}")
-        request = QgsFeatureRequest().setFilterExpression(expr)
-        velo = new_layer.materialize(request)
+        px_w = gt[1]
+        px_h = gt[5]
+        # --- Créer un raster masque en mémoire (même emprise/résolution) ---
+        mem_drv = gdal.GetDriverByName('MEM')
+        mask_ds = mem_drv.Create('', cols, rows, 1, gdal.GDT_Byte)
+        mask_ds.SetGeoTransform(gt)
+        mask_ds.SetProjection(proj)
+        
+        # --- Ouvrir la couche vecteur avec OGR ---
+        mem_ogr_drv = ogr.GetDriverByName('Memory')
+        
+        min_score, max_score = None, None
+        total = new_layer.featureCount()
+
+
+        for current, feature in enumerate(new_layer.getFeatures()):
+            if feedback.isCanceled():
+                break
+ 
+            geom = feature.geometry()
+            
+ 
+            bbox = geom.boundingBox()
+            if bbox.isEmpty():
+                pr.changeAttributeValues({feature.id(): {idx: 0.0}})
+                continue
+ 
+            # Fenêtre pixel correspondant à la bbox du tronçon (+1 pixel de
+            # marge) au lieu de recalculer un masque sur tout le raster.
+            col_min = max(0, int((bbox.xMinimum() - gt[0]) / px_w) - 1)
+            col_max = min(cols, int((bbox.xMaximum() - gt[0]) / px_w) + 2)
+            row_min = max(0, int((bbox.yMaximum() - gt[3]) / px_h) - 1)
+            row_max = min(rows, int((bbox.yMinimum() - gt[3]) / px_h) + 2)
+ 
+            win_cols = col_max - col_min
+            win_rows = row_max - row_min
+            print(win_cols, win_rows)
+            if win_cols <= 0 or win_rows <= 0:
+                new_layer.changeAttributeValue(feature.id(), idx, 0.0)
+
+                continue
+ 
+            sub_gt = (
+                gt[0] + col_min * px_w, px_w, 0,
+                gt[3] + row_min * px_h, 0, px_h,
+            )
+ 
+            mem_ogr_ds = mem_ogr_drv.CreateDataSource('mem')
+            mem_ogr_layer = mem_ogr_ds.CreateLayer('line', geom_type=ogr.wkbLineString)
+            ogr_feat = ogr.Feature(mem_ogr_layer.GetLayerDefn())
+            ogr_feat.SetGeometry(ogr.CreateGeometryFromWkt(geom.asWkt()))
+            mem_ogr_layer.CreateFeature(ogr_feat)
+ 
+            mask_ds = mem_drv.Create('', win_cols, win_rows, 1, gdal.GDT_Byte)
+            mask_ds.SetGeoTransform(sub_gt)
+            mask_ds.SetProjection(proj)
+            gdal.RasterizeLayer(
+                mask_ds, [1], mem_ogr_layer,
+                burn_values=[1],
+                options=['ALL_TOUCHED=TRUE'],
+            )
+            mask_array = mask_ds.GetRasterBand(1).ReadAsArray()
+            src_window = band.ReadAsArray(col_min, row_min, win_cols, win_rows).astype(float)
+ 
+            pixels_values = src_window[mask_array == 1]
+            if nodata is not None:
+                pixels_values = pixels_values[pixels_values != nodata]
+ 
+            score = float(pixels_values.mean()) if pixels_values.size > 0 else 0.0
+            #pr.changeAttributeValues({feature.id(): {idx: score}})
+            new_layer.changeAttributeValue(feature.id(), idx, score)
+
+            
+            min_score = score if min_score is None else min(min_score, score)
+            max_score = score if max_score is None else max(max_score, score)
+ 
+            # Libération explicite des objets GDAL/OGR temporaires
+            mask_ds = None
+            mem_ogr_ds = None
+ 
+            if total > 0:
+                feedback.setProgress(int(current / total * 100))
+ 
+    
+ 
+        if not new_layer.commitChanges():
+            raise QgsProcessingException(
+                "Impossible de committer les valeurs de densité sur la couche temporaire."
+            )
+        
+        # expr = 'raster_value > 50'
+        # feedback.pushInfo(f"Expression aménagements : {expr}")
+        # request = QgsFeatureRequest().setFilterExpression(expr)
+        # velo = new_layer.materialize(request)
 
         (sink, dest_id) = self.parameterAsSink(
             parameters, self.OUTPUT_VECTOR, context,
             new_layer.fields(), new_layer.wkbType(), new_layer.sourceCrs()
         )
-        features = [f for f in velo.getFeatures()]
+        features = [f for f in new_layer.getFeatures()]
         sink.addFeatures(features, QgsFeatureSink.FastInsert)
 
         results = {}

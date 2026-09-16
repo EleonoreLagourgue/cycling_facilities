@@ -190,8 +190,7 @@ class RasterisationPop(QgsProcessingAlgorithm):
                 feedback.pushWarning(f"Feature {f.id()} : population nulle (None), densité mise à 0")
                 densite = 0.0
             elif area:
-                # Conversion en habitants/km² : les valeurs en hab/m² sont
-                # trop petites et s'écrasent facilement à 0 en aval
+                # Conversion en habitants/km2
                 densite = (float(pop) / area) * 1_000_000
             else:
                 feedback.pushWarning(f"Feature {f.id()} : aire nulle, densité mise à 0")
@@ -226,7 +225,7 @@ class RasterisationPop(QgsProcessingAlgorithm):
                         'BURN':0,
                         'USE_Z':False,
                         'UNITS':1,
-                        'WIDTH':20,'HEIGHT':20,
+                        'WIDTH':10,'HEIGHT':10,
                         'EXTENT':new_layer.extent(),'NODATA':-9999,
                         'CREATION_OPTIONS':None,
                         'DATA_TYPE':6,'INIT':None,
@@ -239,6 +238,13 @@ class RasterisationPop(QgsProcessingAlgorithm):
         import os
         print("Existe:", os.path.exists(raster))
         
+        stats = processing.run(
+            "native:rasterlayerstatistics", 
+            {'INPUT':raster,
+             'BAND':1,'OUTPUT_HTML_FILE':'TEMPORARY_OUTPUT'})
+        rmin = stats['MIN']
+        rmax = stats['MAX']
+        feedback.pushInfo(f"{rmin}, {rmax}")
         # test_path = processing.run(
         #     "native:rastercalc", 
         #     {'LAYERS':[raster],

@@ -195,8 +195,10 @@ class AjoutTrafic(QgsProcessingAlgorithm):
         #Vérification
         pr = new_layer.dataProvider()
         existing = set(new_layer.fields().names())
+        print(existing)
         to_add =[]
         if 'pos_key' not in existing:
+            
             to_add = [           
               QgsField('pos_key', QVariant.String)            
                   ]

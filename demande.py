@@ -197,7 +197,7 @@ class Demande(QgsProcessingAlgorithm):
         is_child_algorithm=True,
     )
         
-       
+
         # result = processing.run("gdal:rastercalculator", 
         #                {"INPUT_A": parameters[self.POP], "BAND_A": 1,
         #                 "INPUT_B": parameters[self.PNT], "BAND_B": 1,
