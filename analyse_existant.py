@@ -314,6 +314,14 @@ class AnalyseExistant(QgsProcessingAlgorithm):
                 )
         else:
             profile = SOURCE_PROFILES.get(source_name, {})
+            col_ame = []
+            for col in profile.keys():
+                idx = reseau.fields().indexOf(col)
+                if idx == -1:
+                    feedback.pushInfo(f"Attention : attribut {col} pas présent dans la couche")
+                else:
+                    col_ame.append(col)
+                pass
             custom_values = None
 
         feedback.pushInfo(f"Colonnes sélectionnées : {col_ame} (source : {source_name})")

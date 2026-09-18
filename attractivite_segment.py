@@ -39,6 +39,7 @@ from qgis.PyQt.QtCore import QCoreApplication, QVariant
 
 from qgis.core import (
     QgsProcessing,
+    QgsRasterLayer,
     QgsFeatureRequest,
     QgsProcessingException,
     QgsProcessingAlgorithm,
@@ -342,7 +343,8 @@ class TripGenerationProcessor(QgsProcessingAlgorithm):
                     'INVERT':False,'EXTRA':'',
                     'OUTPUT':QgsProcessingUtils.generateTempFilename(
                         'raster.tif', context)})['OUTPUT']
-        
+        rasterLayer = QgsRasterLayer(raster, 'grade_raster')
+
         ds = gdal.Open(raster) if isinstance(raster, str) else raster
         if ds is None:
             raise RuntimeError(f"Impossible d'ouvrir le raster généré : {raster}")

@@ -31,6 +31,8 @@ __revision__ = '$Format:%H$'
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (
     QgsProcessing,
+    QgsRasterLayer,
+    QgsFeatureRequest,
     QgsProcessingAlgorithm,
     QgsProcessingParameterVectorLayer,
     QgsProcessingParameterRasterLayer,
@@ -50,6 +52,8 @@ from qgis.core import (
     QgsPointXY,
 )
 from qgis import processing
+from osgeo import gdal
+import numpy as np
 
 class AddGradeAlgorithm(QgsProcessingAlgorithm):
  
@@ -187,8 +191,60 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
         distance_area = QgsDistanceArea()
         distance_area.setSourceCrs(source.crs(), QgsProject.instance().transformContext())
         distance_area.setEllipsoid(QgsProject.instance().ellipsoid())
+        
+        densified = processing.run("native:densifygeometriesgivenaninterval", {
+                "INPUT": source,
+                "INTERVAL": 5.0,
+                "OUTPUT": "memory:",
+            })["OUTPUT"]
+        
  
         provider = dem.dataProvider()
+        
+        #----------------test---------------------------------------
+        feature = next(densified.getFeatures())
+        vertices = feature.geometry().asPolyline()
+        
+        profile = []
+        cumulative = 0.0
+        previous = None
+        extent = feature.geometry().boundingBox()
+        extent.grow(dem.rasterUnitsPerPixelX() * 2)
+        
+        width = int(extent.width() / dem.rasterUnitsPerPixelX())
+        height = int(extent.height() / dem.rasterUnitsPerPixelY())
+        block = provider.block(1, extent, width, height)
+        
+        def value_at(point):
+            col = int((point.x() - extent.xMinimum()) / dem.rasterUnitsPerPixelX())
+            row = int((extent.yMaximum() - point.y()) / dem.rasterUnitsPerPixelY())
+            if 0 <= col < width and 0 <= row < height:
+                return block.value(row, col)
+            return None
+        
+        for point in vertices:
+            value, ok = provider.sample(QgsPointXY(point), 1)
+            if previous is not None:
+                cumulative += previous.distance(point)
+            previous = point
+            if ok and value != nodata:
+                profile.append((cumulative, value))
+        
+        rows = []
+        for index, (chainage, height) in enumerate(profile):
+            if index == 0:
+                gradient = 0.0
+            else:
+                run = chainage - profile[index - 1][0]
+                rise = height - profile[index - 1][1]
+                gradient = (rise / run * 100.0) if run else 0.0
+            rows.append({"chainage": chainage, "height": height, "gradient_pct": gradient})
+        
+        climb = sum(r["height"] - p["height"] for p, r in zip(rows, rows[1:]) if r["height"] > p["height"])
+        descent = sum(p["height"] - r["height"] for p, r in zip(rows, rows[1:]) if r["height"] < p["height"])
+        print(f"total climb {climb:.1f} m, total descent {descent:.1f} m, "
+              f"steepest {max(abs(r['gradient_pct']) for r in rows):.1f}%")
+        #--------------------------------------------------------------------
  
         # ---- Passe 1 : identifier les nœuds uniques (snap par grille) ----
         feedback.pushInfo("Étape 1/3 : identification des nœuds du réseau...")
@@ -224,10 +280,13 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
             val, ok = provider.sample(pt_dem, band)
             node_elev[key] = val if ok and val is not None else None
             feedback.setProgress(30 + int(30 * j / n_nodes))
+        
  
         # ---- Préparation des champs de sortie ----
-        pr = source.dataProvider()
-        source.startEditing()
+        lignes = source.materialize(QgsFeatureRequest())
+
+        pr = lignes.dataProvider()
+        lignes.startEditing()
         
         #out_fields = QgsFields(source.fields())
         for fname, ftype in (
@@ -237,13 +296,13 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
             ("grade", QVariant.Double),
             ("grade_abs", QVariant.Double),
         ):
-            pr.addAttributes(QgsField(fname, ftype))
+            pr.addAttributes([QgsField(fname, ftype)])
         
-        source.updateFields()
-        idx_1 = source.fields().lookupField('elev_start')
-        idx_2 = source.fields().lookupField('elev_end')
-        idx_3 = source.fields().lookupField('grade')    
-        idx_4 = source.fields().lookupField('grade_abs')    
+        lignes.updateFields()
+        idx_1 = lignes.fields().lookupField('elev_start')
+        idx_2 = lignes.fields().lookupField('elev_end')
+        idx_3 = lignes.fields().lookupField('grade')    
+        idx_4 = lignes.fields().lookupField('grade_abs')    
 
  
         # ---- calcul de la pente par arête ----
@@ -275,6 +334,7 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
                         grade = (elev_end - elev_start) / length_m
                         if as_percent:
                             grade *= 100.0
+                        print(grade)
                         grade_abs = abs(grade)
  
             
@@ -291,25 +351,48 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
                 "(hors emprise du MNT ou NoData)."
             )
             
-        raster = processing.run("gdal:rasterize", 
-                       {'INPUT': source,
-                        'FIELD':'densité',
+        raster_path = processing.run("gdal:rasterize", 
+                       {'INPUT': lignes,
+                        'FIELD':'grade',
                         'BURN':0,
                         'USE_Z':False,
                         'UNITS':1,
                         'WIDTH':10,'HEIGHT':10,
-                        'EXTENT':None,'NODATA':0,
+                        'EXTENT':None,'NODATA':-9999,
                         'CREATION_OPTIONS':None,
-                        'DATA_TYPE':5,'INIT':None,
+                        'DATA_TYPE':5,'INIT':-9999,
                         'INVERT':False,'EXTRA':'',
-                        'OUTPUT':'memory:'})['OUTPUT']
+                        'OUTPUT':QgsProcessing.TEMPORARY_OUTPUT},
+                       context=context,
+                       feedback=feedback,)['OUTPUT']
         
+        raster = QgsRasterLayer(raster_path, 'grade_raster')
+        if not raster.isValid():
+            raise Exception(
+                f"Le raster de pente intermédiaire n'a pas pu être chargé "
+                f"depuis {raster_path}."
+            )
+        array=raster.as_numpy()
+        ds = gdal.Open(raster_path) if isinstance(raster_path, str) else raster
+        if ds is None:
+            raise RuntimeError(f"Impossible d'ouvrir le raster généré : {raster}")
+        band = ds.GetRasterBand(1)
         
+        feedback.pushInfo(f"Dimensions : {raster.rasterUnitsPerPixelX} x {raster.rasterUnitsPerPixelY} pixels")
+        feedback.pushInfo(f"NoData : {band.GetNoDataValue()}")
+        feedback.pushInfo(f"Min : {np.nanmin(array)}, Max : {np.nanmax(array)}, Moyenne : {np.nanmean(array):.2f}")
+        feedback.pushInfo(f"Valeurs uniques (10 premières) : {np.unique(array)[:10]}")
+        feedback.pushInfo(f"% de pixels à 0 : {(array == 0).sum() / array.size * 100:.1f}%")
+
         if vae:
-            formula = f'if( "{raster.name()}@1"<5,100, if("{raster.name()}@1">10,0,(("{raster.name()}@1" - 5) / (10-5)*100)))'
+            formula = f'if( "{raster.name()}@1" = -9999, -9999, if("{raster.name()}@1"<5,100, if("{raster.name()}@1">10,0,((10-"{raster.name()}@1") / (10-5)*100))))'
+            
+        
+    
+
             result = processing.run(
                 "native:rastercalc", 
-                {'LAYERS':[''],
+                {'LAYERS':[raster],
                  'EXPRESSION':formula,
                  'EXTENT':None,'CELL_SIZE':10,
                  'CRS':None,'CREATION_OPTIONS':None,
@@ -320,10 +403,11 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
 
             
         else:
-            formula = f'if( "{raster.name()}@1"<3,100, if("{raster.name()}@1">10,0,(("{raster.name()}@1" - 3) / (8-3)*100)))'
+            formula = f'if( "{raster.name()}@1" = -9999, -9999, if("{raster.name()}@1"<3,100, if("{raster.name()}@1">8,0,((8-"{raster.name()}@1") / (8-3)*100))))'
+
             result = processing.run(
                 "native:rastercalc", 
-                {'LAYERS':[''],
+                {'LAYERS':[raster],
                  'EXPRESSION':formula,
                  'EXTENT':None,'CELL_SIZE':10,
                  'CRS':None,'CREATION_OPTIONS':None,
@@ -334,4 +418,4 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
 
         
  
-        return {self.OUTPUT: result}
+        return {self.OUTPUT: result['OUTPUT']}

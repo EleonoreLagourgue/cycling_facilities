@@ -52,7 +52,7 @@ from qgis.analysis import (
     QgsGraphAnalyzer
 )
 from qgis import processing
-
+import math
 
 class AjoutTrafic(QgsProcessingAlgorithm):
     """
@@ -160,7 +160,7 @@ class AjoutTrafic(QgsProcessingAlgorithm):
                 self.MAXDIST, 
                 self.tr("Distance maximum entre les entités"),
                 type=QgsProcessingParameterNumber.Double,
-                defaultValue=0.1))
+                defaultValue=2.0))
 
         # We add a feature sink in which to store our processed features (this
         # usually takes the form of a newly created vector layer when the
@@ -257,7 +257,7 @@ class AjoutTrafic(QgsProcessingAlgorithm):
             })
         cpt_aggre = processing.run("native:aggregate", 
                        {'INPUT': new_layer,
-                        'GROUP_BY':'geom_to_wkb($geometry)',
+                        'GROUP_BY':'pos_key',
                         'AGGREGATES':aggregates,
                         'OUTPUT':'memory:compteurs_moyennes'
                         },  context=context, feedback=feedback)['OUTPUT']
@@ -271,11 +271,12 @@ class AjoutTrafic(QgsProcessingAlgorithm):
                         'FIELDS_TO_COPY':[],
                         'DISCARD_NONMATCHING':False,
                         'PREFIX':'','NEIGHBORS':1,
-                        'MAX_DISTANCE':max_dist,'OUTPUT': 'memory:'}
+                        'MAX_DISTANCE':max_dist,'OUTPUT': 'memory:jointure'}
                        , context=context, feedback=feedback)['OUTPUT']
-        
+        feedback.pushInfo(str(result.featureCount()))
         idx_trafic = result.fields().indexOf(field_trafic)
-        #idx_nom = result.fields().indexOf(field_nom)
+        if field_pl:
+            idx_pl = result.fields().indexOf(field_pl)
     
         feats = {f.id(): f for f in result.getFeatures()}
     
@@ -291,7 +292,8 @@ class AjoutTrafic(QgsProcessingAlgorithm):
               - une chaîne de caractères (nature de la voie)
               - un entier 1-6 (champ 'importance' de la BD Topo, 1 = le plus important)
             """
-            PRIORITY_ORDER = ["Autoroute", "Nationale", "Départementale", "primary", "primary_link"]
+            PRIORITY_ORDER = ["Autoroute","motorway", "motorway_link","trunk","trunk_link","primary", "primary_link", "Nationale", "Départementale",
+                              "secondary", "secondary_link", "tertiary", "tertiary_link"]
             if value is None:
                 return len(PRIORITY_ORDER) + 6  # inconnu = le moins prioritaire possible
         
@@ -307,7 +309,39 @@ class AjoutTrafic(QgsProcessingAlgorithm):
             try:
                 return PRIORITY_ORDER.index(value)
             except ValueError:
-                return len(PRIORITY_ORDER) + 6 
+                return len(PRIORITY_ORDER) + 6
+                  
+        def _direction_away(fid, shared_key):
+            
+            """
+            Vecteur normalisé partant du nœud partagé (shared_key) vers
+            l'intérieur du tronçon fid (point suivant sur la ligne).
+            """
+            geom = feats[fid].geometry()
+            line = geom.asMultiPolyline()[0] if geom.isMultipart() else geom.asPolyline()
+            start, end = line[0], line[-1]
+            
+            start_key = (round(start.x(), precision), round(start.y(), precision))
+            if start_key == shared_key:
+                nxt = line[1] if len(line) > 1 else end
+                dx, dy = nxt.x() - start.x(), nxt.y() - start.y()
+            else:
+                nxt = line[-2] if len(line) > 1 else start
+                dx, dy = nxt.x() - end.x(), nxt.y() - end.y()
+            norm = (dx ** 2 + dy ** 2) ** 0.5
+            return (dx / norm, dy / norm) if norm else (0.0, 0.0)
+
+        def is_continuation(fid_a, fid_b, shared_key, angle_max_deg=45):
+            """
+            Pour regarder si un tronçon est bien la continuité du premier ou non
+            selon l'angle entre les deux géométries
+            """
+            vax, vay = _direction_away(fid_a, shared_key)
+            vbx, vby = _direction_away(fid_b, shared_key)
+            cos_angle = max(-1.0, min(1.0, vax * vbx + vay * vby))
+            angle = math.degrees(math.acos(cos_angle))
+            return angle >= (180 - angle_max_deg)
+
                 
         # index des noeuds : {coord arrondie: [fid, fid, ...]}
         vertex_index = {}
@@ -326,58 +360,93 @@ class AjoutTrafic(QgsProcessingAlgorithm):
             current_nom = feats[current_fid][field_nom]
             current_nature = feats[current_fid][field_nature]
             rank = get_rank(current_nature)
-    
-            for pt in endpoints(current_fid):
-                key = (round(pt.x(), precision), round(pt.y(), precision))
-                neighbors = vertex_index.get(key, [])
-    
-                if len(neighbors) > 2:
+            if field_pl:
+                current_pl = feats[current_fid][field_pl]
+                for pt in endpoints(current_fid):
+                    key = (round(pt.x(), precision), round(pt.y(), precision))
+                    neighbors = vertex_index.get(key, [])
                     blocked = False
-                    for n_fid in neighbors:
-                        if n_fid == current_fid:
-                            continue
-                        n_feat = feats[n_fid]
-                        if n_feat[field_nom] == current_nom:
-                            continue  # même nom, pas une "autre route"
-                        nature = n_feat[field_nature]
-                        n_rank = get_rank(nature)
-                        if n_rank<= rank :
-                            blocked = True
-                            break
-                        if blocked:
-                            continue  # vraie intersection avec un axe important, on ne propage pas ici
-                
-                        #Propager la valeur aux tronçons de même nom sans valeur
+                    if len(neighbors) > 2:
                         for n_fid in neighbors:
                             if n_fid == current_fid:
                                 continue
                             n_feat = feats[n_fid]
-                
-                            if n_feat[field_trafic] not in (None, 'NULL'):
-                                continue  # déjà une valeur
-                
-                            if n_feat[field_nom] != current_nom:
-                                continue  # nom différent, on ne propage pas
+                            if n_feat[field_nom] == current_nom:
+                                continue  # même nom, pas une "autre route"
+                            nature = n_feat[field_nature]
+                            n_rank = get_rank(nature)
+                            if n_rank<= rank :
+                                blocked = True
+                                break
+                    if blocked:
+                        continue  # vraie intersection avec un axe important, on ne propage pas ici
+                    
+                    #Propager la valeur aux tronçons de même nom sans valeur
+                    for n_fid in neighbors:
+                        if n_fid == current_fid:
+                            continue
+                        n_feat = feats[n_fid]
+            
+                        if n_feat[field_trafic] not in (None, 'NULL'):
+                            continue  # déjà une valeur
+            
+                        if n_feat[field_nom] != current_nom:
+                            continue  # nom différent, on ne propage pas
+                            
+                        if not is_continuation(current_fid, n_fid, key):
+                            continue  # angle trop marqué : route qui croise, pas qui prolonge
+
+        
+                        result.changeAttributeValue(n_fid, idx_trafic, current_val)
+                        result.changeAttributeValue(n_fid, idx_pl, current_pl)
+                        n_feat.setAttribute(idx_trafic, current_val)
+                        n_feat.setAttribute(idx_pl, current_pl)
+
+                        queue.append(n_fid)
+            
+            else:
+                for pt in endpoints(current_fid):
+                    key = (round(pt.x(), precision), round(pt.y(), precision))
+                    neighbors = vertex_index.get(key, [])
+                    blocked = False
+                    if len(neighbors) > 2:
+                        for n_fid in neighbors:
+                            if n_fid == current_fid:
+                                continue
+                            n_feat = feats[n_fid]
+                            if n_feat[field_nom] == current_nom:
+                                continue  # même nom, pas une "autre route"
+                            nature = n_feat[field_nature]
+                            n_rank = get_rank(nature)
+                            if n_rank<= rank :
+                                blocked = True
+                                break
+                    if blocked:
+                        continue  # vraie intersection avec un axe important, on ne propage pas ici
+                    
+                    #Propager la valeur aux tronçons de même nom sans valeur
+                    for n_fid in neighbors:
+                        if n_fid == current_fid:
+                            continue
+                        n_feat = feats[n_fid]
+            
+                        if n_feat[field_trafic] not in (None, 'NULL'):
+                            continue  # déjà une valeur
+            
+                        if n_feat[field_nom] != current_nom:
+                            continue  # nom différent, on ne propage pas
+                            
+                        if not is_continuation(current_fid, n_fid, key):
+                            continue  # angle trop marqué : route qui croise, pas qui prolonge
     
-                    result.changeAttributeValue(n_fid, idx_trafic, current_val)
-                    n_feat.setAttribute(idx_trafic, current_val)
-                    queue.append(n_fid)
+        
+                        result.changeAttributeValue(n_fid, idx_trafic, current_val)
+                        n_feat.setAttribute(idx_trafic, current_val)
+                        queue.append(n_fid)
                                 
                       #vraie intersection -> on ne propage pas à travers ce noeud
     
-                for n_fid in neighbors:
-                    if n_fid == current_fid:
-                        continue
-                    n_feat = feats[n_fid]
-    
-                    if n_feat[field_trafic] not in (None, 'NULL'):
-                        continue  # déjà une valeur, on ne l'écrase pas
-                    if n_feat[field_nom] != current_nom:
-                        continue  # nom différent donc pas la même route
-    
-                    result.changeAttributeValue(n_fid, idx_trafic, current_val)
-                    n_feat.setAttribute(idx_trafic, current_val)  
-                    queue.append(n_fid)
+                
     
         result.commitChanges()
         

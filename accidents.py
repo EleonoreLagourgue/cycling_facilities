@@ -111,14 +111,14 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
         )
         self.addParameter(
             QgsProcessingParameterNumber(
-                self.RADIUS, "Rayon d'attractivité (unités du CRS des PNT, ex: mètres)",
+                self.RADIUS, "Rayon d'attractivité (unités du CRS des accidents, ex: mètres)",
                 type=QgsProcessingParameterNumber.Double,
                 defaultValue=1000,
             )
         )
         self.addParameter(
             QgsProcessingParameterNumber(
-                self.PIXEL_SIZE, 'Taille de pixel (unités du CRS des PNT)',
+                self.PIXEL_SIZE, 'Taille de pixel (unités du CRS des accidents)',
                 type=QgsProcessingParameterNumber.Double,
                 defaultValue=10,
             )
@@ -127,7 +127,7 @@ class RasteriserAccidents(QgsProcessingAlgorithm):
         # Sink de sortie
         self.addParameter(
             QgsProcessingParameterRasterDestination(
-                self.OUTPUT, 'Réseau enrichi de la demande'
+                self.OUTPUT, 'Réseau enrichi des accidents'
             )
         )
 
