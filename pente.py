@@ -221,7 +221,8 @@ class AddGradeAlgorithm(QgsProcessingAlgorithm):
             if 0 <= col < width and 0 <= row < height:
                 return block.value(row, col)
             return None
-        
+        nodata =provider.sourceNoDataValue(band)
+
         for point in vertices:
             value, ok = provider.sample(QgsPointXY(point), 1)
             if previous is not None:
