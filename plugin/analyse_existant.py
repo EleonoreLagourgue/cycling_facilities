@@ -33,6 +33,7 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingUtils,
                        QgsFeatureRequest,
                        QgsFeatureSink,
+                       QgsRasterLayer,
                        QgsProcessingAlgorithm,
                        QgsProcessingParameterRasterDestination,
                        QgsProcessingParameterFeatureSource,
@@ -63,6 +64,7 @@ from collections import OrderedDict, defaultdict
 from scipy.spatial import cKDTree
 import pandas as pd
 import numpy as np
+import math
 
 from qgis.core import QgsApplication
 
@@ -344,18 +346,35 @@ class AnalyseExistant(QgsProcessingAlgorithm):
         
         
         # On cherche les tronçons entre deux aménagements
+        def slope(x1, y1, x2, y2): # Line slope given two points:
+            return (y2-y1)/(x2-x1)
         
+        def angle(s1, s2): 
+            return math.degrees(math.atan((s2-s1)/(1+(s2*s1))))
         
         ame_feat = [feat for feat in velo.getFeatures()]
         trou = []
         for feat in sans_ame.getFeatures():
             geometry = feat.geometry()
             voisins =[]
+            line = geometry.asMultiPolyline()[0] if geometry.isMultipart() else geometry.asPolyline()
+            start, end = line[0], line[-1]
+            x1,y1 = start.x(), start.y()
+            x2,y2 = end.x(), end.y()
+            s1 = slope(x1, y1, x2, y2)
+
             for f in ame_feat:
                 geom_velo = f.geometry()
                 test = geometry.touches(geom_velo)
-                if test:
-                    voisins.append(f)
+                if test: # Touche un tronçon aménagé
+                    line = geom_velo.asMultiPolyline()[0] if geom_velo.isMultipart() else geom_velo.asPolyline()
+                    start2, end2 = line[0], line[-1]
+                    x1b,y1b = start2.x(), start2.y()
+                    x2b,y2b = end2.x(), end2.y()
+                    s2 = slope(x1b, y1b, x2b, y2b)
+                    agl = angle(s1, s2)
+                    if agl >= 135: # On considère que ce n'est pas une intersection
+                        voisins.append(f)
             if len(voisins)>1:
                 trou.append(feat)
 
@@ -498,7 +517,18 @@ class AnalyseExistant(QgsProcessingAlgorithm):
         print("Chemin raster:", repr(raster))
         import os
         print("Existe:", os.path.exists(raster))
-        
+        rlayer = QgsRasterLayer(raster, "Rasterisé")
+        formula = f'("{rlayer}@1"- MIN ( "{rlayer}@1"))/ ( MAX ( "{rlayer}@1") - MIN ( "{rlayer}@1"))'
+        result = processing.run("native:rastercalc", 
+                       {'LAYERS':[rlayer],
+                        'EXPRESSION':formula,
+                        'EXTENT':None,
+                        'CELL_SIZE':None,
+                        'CRS':None,
+                        'CREATION_OPTIONS':None,
+                        'OUTPUT':parameters[self.OUTPUT]})
+        processing.run("native:rastercalc", 
+                       {'LAYERS':['D:/TFE/donnees/donnees_creees/MNT_proj.tif'],'EXPRESSION':' MIN ( "MNT_proj@1") -  MAX ( "MNT_proj@1")','EXTENT':None,'CELL_SIZE':None,'CRS':None,'CREATION_OPTIONS':None,'OUTPUT':'TEMPORARY_OUTPUT'})
         ds = gdal.Open(raster) if isinstance(raster, str) else raster
         if ds is None:
             raise RuntimeError(f"Impossible d'ouvrir le raster généré : {raster}")

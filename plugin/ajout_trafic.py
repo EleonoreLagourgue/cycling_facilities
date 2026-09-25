@@ -341,6 +341,13 @@ class AjoutTrafic(QgsProcessingAlgorithm):
             cos_angle = max(-1.0, min(1.0, vax * vbx + vay * vby))
             angle = math.degrees(math.acos(cos_angle))
             return angle >= (180 - angle_max_deg)
+        
+        
+            def slope(x1, y1, x2, y2): # Line slope given two points:
+                return (y2-y1)/(x2-x1)
+            
+            def angle(s1, s2): 
+                return math.degrees(math.atan((s2-s1)/(1+(s2*s1))))
 
                 
         # index des noeuds : {coord arrondie: [fid, fid, ...]}
